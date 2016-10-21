@@ -1,36 +1,3 @@
-// NodeS7 - A library for communication to Siemens PLCs from node.js.
-
-// The MIT License (MIT)
-
-// Copyright (c) 2013 Dana Moffit
-
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-// THE SOFTWARE.
-
-// EXTRA WARNING - This is BETA software and as such, be careful, especially when
-// writing values to programmable controllers.
-//
-// Some actions or errors involving programmable controllers can cause injury or death,
-// and YOU are indicating that you understand the risks, including the
-// possibility that the wrong address will be overwritten with the wrong value,
-// when using this library.  Test thoroughly in a laboratory environment.
-
-
 var net = require("net");
 var util = require("util");
 var effectiveDebugLevel = 0; // intentionally global, shared between connections
@@ -101,20 +68,32 @@ NodeS7.prototype.setTranslationCB = function(cb) {
 
 NodeS7.prototype.initiateConnection = function(cParam, callback) {
 	var self = this;
-	if (cParam === undefined) { cParam = { port: 102, host: '192.168.8.106' }; }
-	outputLog('Initiate Called - Connecting to PLC with address and parameters:');
+
+	if (cParam === undefined) { 
+		cParam = { 
+			port: 102, 
+			host: '192.168.8.106' 
+		}; 
+	}
+	
+	outputLog('initiateConnection - Connecting to PLC with address and parameters:');
+	
 	outputLog(cParam);
+	
 	if (typeof (cParam.rack) !== 'undefined') {
 		self.rack = cParam.rack;
 	}
+	
 	if (typeof (cParam.slot) !== 'undefined') {
 		self.slot = cParam.slot;
 	}
+	
 	if (typeof (cParam.connection_name) === 'undefined') {
 		self.connectionID = cParam.host + " S" + self.slot;
 	} else {
 		self.connectionID = cParam.connection_name;
 	}
+	
 	self.connectionParams = cParam;
 	self.connectCallback = callback;
 	self.connectCBIssued = false;
@@ -126,7 +105,9 @@ NodeS7.prototype.dropConnection = function(callback) {
 	if (typeof (self.isoclient) !== 'undefined') {
 		// store the callback and request and end to the connection
 		self.dropConnectionCallback = callback;
+
 		self.isoclient.end();
+		
 		// now wait for 'on close' event to trigger connection cleanup
 
 		// but also start a timer to destroy the connection in case we do not receive the close
@@ -150,8 +131,10 @@ NodeS7.prototype.dropConnection = function(callback) {
 
 NodeS7.prototype.connectNow = function(cParam) {
 	var self = this;
+
 	// Don't re-trigger.
 	if (self.isoConnectionState >= 1) { return; }
+	
 	self.connectionCleanup();
 	self.isoclient = net.connect(cParam, function() {
 		self.onTCPConnect.apply(self, arguments);
@@ -188,7 +171,9 @@ NodeS7.prototype.readWriteError = function(e) {
 
 NodeS7.prototype.packetTimeout = function(packetType, packetSeqNum) {
 	var self = this;
+
 	outputLog('PacketTimeout called with type ' + packetType + ' and seq ' + packetSeqNum, 1, self.connectionID);
+
 	if (packetType === "connect") {
 		outputLog("TIMED OUT connecting to the PLC - Disconnecting", 0, self.connectionID);
 		outputLog("Wait for 2 seconds then try again.", 0, self.connectionID);
@@ -200,6 +185,7 @@ NodeS7.prototype.packetTimeout = function(packetType, packetSeqNum) {
 		}, 2000, self.connectionParams);
 		return undefined;
 	}
+
 	if (packetType === "PDU") {
 		outputLog("TIMED OUT waiting for PDU reply packet from PLC - Disconnecting");
 		outputLog("Wait for 2 seconds then try again.", 0, self.connectionID);
@@ -211,16 +197,19 @@ NodeS7.prototype.packetTimeout = function(packetType, packetSeqNum) {
 		}, 2000, self.connectionParams);
 		return undefined;
 	}
+	
 	if (packetType === "read") {
 		outputLog("READ TIMEOUT on sequence number " + packetSeqNum, 0, self.connectionID);
 		self.readResponse(undefined, self.findReadIndexOfSeqNum(packetSeqNum));
 		return undefined;
 	}
+	
 	if (packetType === "write") {
 		outputLog("WRITE TIMEOUT on sequence number " + packetSeqNum, 0, self.connectionID);
 		self.writeResponse(undefined, self.findWriteIndexOfSeqNum(packetSeqNum));
 		return undefined;
 	}
+	
 	outputLog("Unknown timeout error.  Nothing was done - this shouldn't happen.");
 }
 
@@ -261,6 +250,7 @@ NodeS7.prototype.onTCPConnect = function() {
 
 NodeS7.prototype.onISOConnectReply = function(data) {
 	var self = this;
+
 	self.isoclient.removeAllListeners('data'); //self.onISOConnectReply);
 	self.isoclient.removeAllListeners('error');
 
@@ -289,6 +279,7 @@ NodeS7.prototype.onISOConnectReply = function(data) {
 	}, self.globalTimeout, "PDU");
 
 	self.isoclient.write(self.negotiatePDU.slice(0, 25));
+
 	self.isoclient.on('data', function() {
 		self.onPDUReply.apply(self, arguments);
 	});
@@ -1190,13 +1181,6 @@ NodeS7.prototype.readResponse = function(data, foundSeqNum) {
 	var dataPointer = 21; // For non-routed packets we start at byte 21 of the packet.  If we do routing it will be more than this.
 	var dataObject = {};
 
-	//	if (self.readPacketArray.timeod (i forget what was going on here)
-	//	if (typeof(data) === "undefined") {
-	//		outputLog("Undefined " + foundSeqNum);
-	//	} else {
-	//		outputLog("Defined " + foundSeqNum);
-	//	}
-
 	outputLog("ReadResponse called", 1, self.connectionID);
 
 	if (!self.readPacketArray[foundSeqNum].sent) {
@@ -1289,24 +1273,25 @@ NodeS7.prototype.onClientDisconnect = function() {
 		self.connectCallback("Error - TCP connected, ISO didn't");
 	}
 
-	// We used to call self.connectionCleanup() - in other words we would give up.
-	// However - realize that this event is called when the OTHER END of the connection sends a FIN packet.
+	// This event is called when the OTHER END of the connection sends a FIN packet.
 	// Certain situations (download user program to mem card on S7-400, pop memory card out of S7-300, both with NetLink) cause this to happen.
 	// So now, let's try a "connetionReset".  This way, we are guaranteed to return values (or bad) and reset at the proper time.
-	// self.connectionCleanup();
 	self.connectionReset();
 }
 
 NodeS7.prototype.onClientClose = function() {
 	var self = this;
+
     // clean up the connection now the socket has closed
 	self.connectionCleanup();
 
     // initiate the callback stored by dropConnection
     if (self.dropConnectionCallback) {
         self.dropConnectionCallback();
+
         // prevent any possiblity of the callback being called twice
         self.dropConnectionCallback = null;
+
         // and cancel the timeout
         clearTimeout(self.dropConnectionTimer);
     }
@@ -1398,7 +1383,6 @@ function S7AddrToBuffer(addrinfo, isWriting) {
 }
 
 function processS7Packet(theData, theItem, thePointer) {
-
 	var remainingLength;
 
 	if (typeof (theData) === "undefined") {
@@ -1488,7 +1472,6 @@ function processS7Packet(theData, theItem, thePointer) {
 }
 
 function processS7WriteItem(theData, theItem, thePointer) {
-
 	var remainingLength;
 
 	if (!theData) {
@@ -1558,7 +1541,6 @@ function writePostProcess(theItem) {
 
 
 function processS7ReadItem(theItem) {
-
 	var thePointer = 0;
 	var strlen = 0;
 
@@ -2251,10 +2233,14 @@ function outputLog(txt, debugLevel, id) {
 	if (silentMode) return;
 
 	var idtext;
+
 	if (typeof (id) === 'undefined') {
 		idtext = '';
 	} else {
 		idtext = ' ' + id;
 	}
-	if (typeof (debugLevel) === 'undefined' || effectiveDebugLevel >= debugLevel) { console.log('[' + process.hrtime() + idtext + '] ' + util.format(txt)); }
+
+	if (typeof (debugLevel) === 'undefined' || effectiveDebugLevel >= debugLevel) { 
+		console.log('[' + process.hrtime() + idtext + '] ' + util.format(txt)); 
+	}
 }
