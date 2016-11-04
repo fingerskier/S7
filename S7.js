@@ -1,216 +1,208 @@
 var net = require("net");
 var util = require("util");
 var effectiveDebugLevel = 0; // intentionally global, shared between connections
-var silentMode = false;
 
-module.exports = NodeS7;
+var options = {
+	connectReq = new Buffer([0x03, 0x00, 0x00, 0x16, 0x11, 0xe0, 0x00, 0x00, 0x00, 0x02, 0x00, 0xc0, 0x01, 0x0a, 0xc1, 0x02, 0x01, 0x00, 0xc2, 0x02, 0x01, 0x02]),
+	negotiatePDU = new Buffer([0x03, 0x00, 0x00, 0x19, 0x02, 0xf0, 0x80, 0x32, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x08, 0x00, 0x08, 0x03, 0xc0]),
+	readReqHeader = new Buffer([0x03, 0x00, 0x00, 0x1f, 0x02, 0xf0, 0x80, 0x32, 0x01, 0x00, 0x00, 0x08, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x04, 0x01]),
+	readReq = new Buffer(1500),
+	writeReqHeader = new Buffer([0x03, 0x00, 0x00, 0x1f, 0x02, 0xf0, 0x80, 0x32, 0x01, 0x00, 0x00, 0x08, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x05, 0x01]),
+	writeReq = new Buffer(1500),
 
-function NodeS7(opts) {
-	opts = opts || {};
-	silentMode = opts.silent || false;
-	effectiveDebugLevel = opts.debug ? 99 : 0
+	resetPending = false,
+	resetTimeout = undefined,
+	isoclient = undefined,
+	isoConnectionState = 0,
+	requestMaxPDU = 960,
+	maxPDU = 960,
+	requestMaxParallel = 8,
+	maxParallel = 8,
+	parallelJobsNow = 0,
+	maxGap = 5,
+	doNotOptimize = false,
+	connectCallback = undefined,
+	readDoneCallback = undefined,
+	writeDoneCallback = undefined,
+	connectTimeout = undefined,
+	PDUTimeout = undefined,
+	globalTimeout = 1500, // In many use cases we will want to increase this
 
-	var self = this;
+	rack = 0,
+	slot = 2,
 
-	self.connectReq = new Buffer([0x03, 0x00, 0x00, 0x16, 0x11, 0xe0, 0x00, 0x00, 0x00, 0x02, 0x00, 0xc0, 0x01, 0x0a, 0xc1, 0x02, 0x01, 0x00, 0xc2, 0x02, 0x01, 0x02]);
-	self.negotiatePDU = new Buffer([0x03, 0x00, 0x00, 0x19, 0x02, 0xf0, 0x80, 0x32, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x08, 0x00, 0x08, 0x03, 0xc0]);
-	self.readReqHeader = new Buffer([0x03, 0x00, 0x00, 0x1f, 0x02, 0xf0, 0x80, 0x32, 0x01, 0x00, 0x00, 0x08, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x04, 0x01]);
-	self.readReq = new Buffer(1500);
-	self.writeReqHeader = new Buffer([0x03, 0x00, 0x00, 0x1f, 0x02, 0xf0, 0x80, 0x32, 0x01, 0x00, 0x00, 0x08, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x05, 0x01]);
-	self.writeReq = new Buffer(1500);
-
-	self.resetPending = false;
-	self.resetTimeout = undefined;
-	self.isoclient = undefined;
-	self.isoConnectionState = 0;
-	self.requestMaxPDU = 960;
-	self.maxPDU = 960;
-	self.requestMaxParallel = 8;
-	self.maxParallel = 8;
-	self.parallelJobsNow = 0;
-	self.maxGap = 5;
-	self.doNotOptimize = false;
-	self.connectCallback = undefined;
-	self.readDoneCallback = undefined;
-	self.writeDoneCallback = undefined;
-	self.connectTimeout = undefined;
-	self.PDUTimeout = undefined;
-	self.globalTimeout = 1500; // In many use cases we will want to increase this
-
-	self.rack = 0;
-	self.slot = 2;
-
-	self.readPacketArray = [];
-	self.writePacketArray = [];
-	self.polledReadBlockList = [];
-	self.instantWriteBlockList = [];
-	self.globalReadBlockList = [];
-	self.globalWriteBlockList = [];
-	self.masterSequenceNumber = 1;
-	self.translationCB = doNothing;
-	self.conx_params = undefined;
-	self.conx_ID = 'UNDEF';
-	self.addRemoveArray = [];
-	self.readPacketValid = false;
-	self.writeInQueue = false;
-	self.connectCBIssued = false;
-	self.dropConnectionCallback = null;
-	self.dropConnectionTimer = null;
+	readPacketArray = [],
+	writePacketArray = [],
+	polledReadBlockList = [],
+	instantWriteBlockList = [],
+	globalReadBlockList = [],
+	globalWriteBlockList = [],
+	masterSequenceNumber = 1,
+	translationCB = doNothing,
+	connectionParams = undefined,
+	connectionID = 'UNDEF',
+	addRemoveArray = [],
+	readPacketValid = false,
+	writeInQueue = false,
+	connectCBIssued = false,
+	dropConnectionCallback = null,
+	dropConnectionTimer = null
 }
 
-NodeS7.prototype.setTranslationCB = function(cb) {
-	// Set the translation callback
-	var self = this;
+module.exports = function(opts) {
+	for (var X in opts) options[X] = opts[X]
 
-	if (typeof cb === "function") {
-		self.translationCB = cb;
-	} else {
-		console.error('Translation callback is not a function')
-	}
-}
-
-NodeS7.prototype.initialize = function(conx_param, callback) {
-	console.log('NodeS7 : initialize - Connecting to PLC with address and parameters:');
-	var self = this;
-
-	if (conx_param === undefined) { 
-		conx_param = { 
-			port: 102, 
-			host: '192.168.8.106' 
-		}; 
-	}
-
-
-	console.log(conx_param);
-
-	if (typeof (conx_param.rack) !== 'undefined') {
-		self.rack = conx_param.rack;
-	}
-	
-	if (typeof (conx_param.slot) !== 'undefined') {
-		self.slot = conx_param.slot;
-	}
-	
-	if (typeof (conx_param.connection_name) === 'undefined') {
-		self.conx_ID = conx_param.host + " S" + self.slot;
-	} else {
-		self.conx_ID = conx_param.connection_name;
-	}
-	
-	self.conx_params = conx_param;
-	self.connectCallback = callback;
-	self.connectCBIssued = false;
-
-	self.connectNow(self.conx_params, false);
-}
-
-NodeS7.prototype.dropConnection = function(callback) {
-	var self = this;
-	if (typeof (self.isoclient) !== 'undefined') {
-		// store the callback and request and end to the connection
-		self.dropConnectionCallback = callback;
-
-		self.isoclient.end();
-		
-		// now wait for 'on close' event to trigger connection cleanup
-
-		// but also start a timer to destroy the connection in case we do not receive the close
-		self.dropConnectionTimer = setTimeout(function() {
-			if (self.dropConnectionCallback) {
-				// destroy the socket connection
-				self.isoclient.destroy();
-				// clean up the connection now the socket has closed
-				self.connectionCleanup();
-				// initate the callback
-				self.dropConnectionCallback();
-				// prevent any possiblity of the callback being called twice
-				self.dropConnectionCallback = null;
+	return {
+		setTranslationCB : function(cb) {
+			if (typeof cb === "function") {
+				options.translationCB = cb;
+			} else {
+				console.errr('Translation callback not a function')
+		}
+		,
+		initiateConnection : function(conx_param, callback) {
+			if (conx_param === undefined) { 
+				conx_param = { 
+					port: 102, 
+					host: '192.168.8.106' 
+				}; 
 			}
-		}, 2500);
-	} else {
-		// if client not active, then callback immediately
-		callback();
+			
+			console.log('initiateConnection - Connecting to PLC with address and parameters:');
+			
+			console.log(conx_param);
+			
+			if (typeof (conx_param.rack) !== 'undefined') {
+				options.rack = conx_param.rack;
+			}
+			
+			if (typeof (conx_param.slot) !== 'undefined') {
+				options.slot = conx_param.slot;
+			}
+			
+			if (typeof (conx_param.connection_name) === 'undefined') {
+				options.connectionID = conx_param.host + " S" + options.slot;
+			} else {
+				options.connectionID = conx_param.connection_name;
+			}
+			
+			options.connectionParams = conx_param;
+			options.connectCallback = callback;
+			options.connectCBIssued = false;
+			options.connectNow(options.connectionParams, false);
+		}
+		,
+		dropConnection = function(callback) {
+			var self = this;
+			if (typeof (options.isoclient) !== 'undefined') {
+				// store the callback and request and end to the connection
+				options.dropConnectionCallback = callback;
+
+				options.isoclient.end();
+				
+				// now wait for 'on close' event to trigger connection cleanup
+
+				// but also start a timer to destroy the connection in case we do not receive the close
+				options.dropConnectionTimer = setTimeout(function() {
+					if (options.dropConnectionCallback) {
+						// destroy the socket connection
+						options.isoclient.destroy();
+						// clean up the connection now the socket has closed
+						options.connectionCleanup();
+						// initate the callback
+						options.dropConnectionCallback();
+						// prevent any possiblity of the callback being called twice
+						options.dropConnectionCallback = null;
+					}
+				}, 2500);
+			} else {
+				// if client not active, then callback immediately
+				callback();
+			}
+		}
 	}
 }
 
-NodeS7.prototype.connectNow = function(conx_param) {
+NodeS7.prototype.
+
+NodeS7.prototype.connectNow = function(cParam) {
 	var self = this;
 
 	// Don't re-trigger.
-	if (self.isoConnectionState >= 1) { return; }
+	if (options.isoConnectionState >= 1) { return; }
 	
-	self.connectionCleanup();
-	self.isoclient = net.connect(conx_param, function() {
-		self.onTCPConnect.apply(self, arguments);
+	options.connectionCleanup();
+	options.isoclient = net.connect(cParam, function() {
+		options.onTCPConnect.apply(self, arguments);
 	});
 
-	self.isoConnectionState = 1;  // 1 = trying to connect
+	options.isoConnectionState = 1;  // 1 = trying to connect
 
-	self.isoclient.on('error', function() {
-		self.connectError.apply(self, arguments);
+	options.isoclient.on('error', function() {
+		options.connectError.apply(self, arguments);
 	});
 
-	console.log('<initiating a new connection ' + Date() + '>', 1, self.conx_ID);
-	console.log('Attempting to connect to host...', 0, self.conx_ID);
+	console.log('<initiating a new connection ' + Date() + '>', 1, options.connectionID);
+	console.log('Attempting to connect to host...', 0, options.connectionID);
 }
 
 NodeS7.prototype.connectError = function(e) {
 	var self = this;
 
 	// Note that a TCP connection timeout error will appear here.  An ISO connection timeout error is a packet timeout.
-	console.log('We Caught a connect error ' + e.code, 0, self.conx_ID);
-	if ((!self.connectCBIssued) && (typeof (self.connectCallback) === "function")) {
-		self.connectCBIssued = true;
-		self.connectCallback(e);
+	console.log('We Caught a connect error ' + e.code, 0, options.connectionID);
+	if ((!options.connectCBIssued) && (typeof (options.connectCallback) === "function")) {
+		options.connectCBIssued = true;
+		options.connectCallback(e);
 	}
-	self.isoConnectionState = 0;
+	options.isoConnectionState = 0;
 }
 
 NodeS7.prototype.readWriteError = function(e) {
 	var self = this;
 	console.log('We Caught a read/write error ' + e.code + ' - will DISCONNECT and attempt to reconnect.');
-	self.isoConnectionState = 0;
-	self.connectionReset();
+	options.isoConnectionState = 0;
+	options.connectionReset();
 }
 
 NodeS7.prototype.packetTimeout = function(packetType, packetSeqNum) {
 	var self = this;
 
-	console.log('PacketTimeout called with type ' + packetType + ' and seq ' + packetSeqNum, 1, self.conx_ID);
+	console.log('PacketTimeout called with type ' + packetType + ' and seq ' + packetSeqNum, 1, options.connectionID);
 
 	if (packetType === "connect") {
-		console.log("TIMED OUT connecting to the PLC - Disconnecting", 0, self.conx_ID);
-		console.log("Wait for 2 seconds then try again.", 0, self.conx_ID);
-		self.connectionReset();
-		console.log("Scheduling a reconnect from packetTimeout, connect type", 0, self.conx_ID);
+		console.log("TIMED OUT connecting to the PLC - Disconnecting", 0, options.connectionID);
+		console.log("Wait for 2 seconds then try again.", 0, options.connectionID);
+		options.connectionReset();
+		console.log("Scheduling a reconnect from packetTimeout, connect type", 0, options.connectionID);
 		setTimeout(function() {
-			console.log("The scheduled reconnect from packetTimeout, connect type, is happening now", 0, self.conx_ID);
-			self.connectNow.apply(self, arguments);
-		}, 2000, self.conx_params);
+			console.log("The scheduled reconnect from packetTimeout, connect type, is happening now", 0, options.connectionID);
+			options.connectNow.apply(self, arguments);
+		}, 2000, options.connectionParams);
 		return undefined;
 	}
 
 	if (packetType === "PDU") {
 		console.log("TIMED OUT waiting for PDU reply packet from PLC - Disconnecting");
-		console.log("Wait for 2 seconds then try again.", 0, self.conx_ID);
-		self.connectionReset();
-		console.log("Scheduling a reconnect from packetTimeout, connect type", 0, self.conx_ID);
+		console.log("Wait for 2 seconds then try again.", 0, options.connectionID);
+		options.connectionReset();
+		console.log("Scheduling a reconnect from packetTimeout, connect type", 0, options.connectionID);
 		setTimeout(function() {
-			console.log("The scheduled reconnect from packetTimeout, PDU type, is happening now", 0, self.conx_ID);
-			self.connectNow.apply(self, arguments);
-		}, 2000, self.conx_params);
+			console.log("The scheduled reconnect from packetTimeout, PDU type, is happening now", 0, options.connectionID);
+			options.connectNow.apply(self, arguments);
+		}, 2000, options.connectionParams);
 		return undefined;
 	}
 	
 	if (packetType === "read") {
-		console.log("READ TIMEOUT on sequence number " + packetSeqNum, 0, self.conx_ID);
-		self.readResponse(undefined, self.findReadIndexOfSeqNum(packetSeqNum));
+		console.log("READ TIMEOUT on sequence number " + packetSeqNum, 0, options.connectionID);
+		options.readResponse(undefined, options.findReadIndexOfSeqNum(packetSeqNum));
 		return undefined;
 	}
 	
 	if (packetType === "write") {
-		console.log("WRITE TIMEOUT on sequence number " + packetSeqNum, 0, self.conx_ID);
-		self.writeResponse(undefined, self.findWriteIndexOfSeqNum(packetSeqNum));
+		console.log("WRITE TIMEOUT on sequence number " + packetSeqNum, 0, options.connectionID);
+		options.writeResponse(undefined, options.findWriteIndexOfSeqNum(packetSeqNum));
 		return undefined;
 	}
 	
@@ -220,34 +212,34 @@ NodeS7.prototype.packetTimeout = function(packetType, packetSeqNum) {
 NodeS7.prototype.onTCPConnect = function() {
 	var self = this;
 
-	console.log('TCP Connection Established to ' + self.isoclient.remoteAddress + ' on port ' + self.isoclient.remotePort, 0, self.conx_ID);
-	console.log('Will attempt ISO-on-TCP connection', 0, self.conx_ID);
+	console.log('TCP Connection Established to ' + options.isoclient.remoteAddress + ' on port ' + options.isoclient.remotePort, 0, options.connectionID);
+	console.log('Will attempt ISO-on-TCP connection', 0, options.connectionID);
 
 	// Track the connection state
-	self.isoConnectionState = 2;  // 2 = TCP connected, wait for ISO connection confirmation
+	options.isoConnectionState = 2;  // 2 = TCP connected, wait for ISO connection confirmation
 
 	// Send an ISO-on-TCP connection request.
-	self.connectTimeout = setTimeout(function() {
-		self.packetTimeout.apply(self, arguments);
-	}, self.globalTimeout, "connect");
+	options.connectTimeout = setTimeout(function() {
+		options.packetTimeout.apply(self, arguments);
+	}, options.globalTimeout, "connect");
 
-	self.connectReq[21] = self.rack * 32 + self.slot;
+	options.connectReq[21] = options.rack * 32 + options.slot;
 
-	self.isoclient.write(self.connectReq.slice(0, 22));
+	options.isoclient.write(options.connectReq.slice(0, 22));
 
 	// Listen for a reply.
-	self.isoclient.on('data', function() {
-		self.onISOConnectReply.apply(self, arguments);
+	options.isoclient.on('data', function() {
+		options.onISOConnectReply.apply(self, arguments);
 	});
 
 	// Hook up the event that fires on disconnect
-	self.isoclient.on('end', function() {
-		self.onClientDisconnect.apply(self, arguments);
+	options.isoclient.on('end', function() {
+		options.onClientDisconnect.apply(self, arguments);
 	});
 
     // listen for close (caused by us sending an end)
-	self.isoclient.on('close', function() {
-		self.onClientClose.apply(self, arguments);
+	options.isoclient.on('close', function() {
+		options.onClientClose.apply(self, arguments);
 
 	});
 }
@@ -255,101 +247,101 @@ NodeS7.prototype.onTCPConnect = function() {
 NodeS7.prototype.onISOConnectReply = function(data) {
 	var self = this;
 
-	self.isoclient.removeAllListeners('data'); //self.onISOConnectReply);
-	self.isoclient.removeAllListeners('error');
+	options.isoclient.removeAllListeners('data'); //options.onISOConnectReply);
+	options.isoclient.removeAllListeners('error');
 
-	clearTimeout(self.connectTimeout);
+	clearTimeout(options.connectTimeout);
 
 	// Track the connection state
-	self.isoConnectionState = 3;  // 3 = ISO-ON-TCP connected, Wait for PDU response.
+	options.isoConnectionState = 3;  // 3 = ISO-ON-TCP connected, Wait for PDU response.
 
 	// Expected length is from packet sniffing - some applications may be different, especially using routing - not considered yet.
 	if (data.readInt16BE(2) !== data.length || data.length < 22 || data[5] !== 0xd0 || data[4] !== (data.length - 5)) {
 		console.log('INVALID PACKET or CONNECTION REFUSED - DISCONNECTING');
 		console.log(data);
 		console.log('TPKT Length From Header is ' + data.readInt16BE(2) + ' and RCV buffer length is ' + data.length + ' and COTP length is ' + data.readUInt8(4) + ' and data[5] is ' + data[5]);
-		self.connectionReset();
+		options.connectionReset();
 		return null;
 	}
 
-	console.log('ISO-on-TCP Connection Confirm Packet Received', 0, self.conx_ID);
+	console.log('ISO-on-TCP Connection Confirm Packet Received', 0, options.connectionID);
 
-	self.negotiatePDU.writeInt16BE(self.requestMaxParallel, 19);
-	self.negotiatePDU.writeInt16BE(self.requestMaxParallel, 21);
-	self.negotiatePDU.writeInt16BE(self.requestMaxPDU, 23);
+	options.negotiatePDU.writeInt16BE(options.requestMaxParallel, 19);
+	options.negotiatePDU.writeInt16BE(options.requestMaxParallel, 21);
+	options.negotiatePDU.writeInt16BE(options.requestMaxPDU, 23);
 
-	self.PDUTimeout = setTimeout(function() {
-		self.packetTimeout.apply(self, arguments);
-	}, self.globalTimeout, "PDU");
+	options.PDUTimeout = setTimeout(function() {
+		options.packetTimeout.apply(self, arguments);
+	}, options.globalTimeout, "PDU");
 
-	self.isoclient.write(self.negotiatePDU.slice(0, 25));
+	options.isoclient.write(options.negotiatePDU.slice(0, 25));
 
-	self.isoclient.on('data', function() {
-		self.onPDUReply.apply(self, arguments);
+	options.isoclient.on('data', function() {
+		options.onPDUReply.apply(self, arguments);
 	});
 
-	self.isoclient.on('error', function() {
-		self.readWriteError.apply(self, arguments);
+	options.isoclient.on('error', function() {
+		options.readWriteError.apply(self, arguments);
 	});
 }
 
 NodeS7.prototype.onPDUReply = function(data) {
 	var self = this;
-	self.isoclient.removeAllListeners('data');
-	self.isoclient.removeAllListeners('error');
+	options.isoclient.removeAllListeners('data');
+	options.isoclient.removeAllListeners('error');
 
-	clearTimeout(self.PDUTimeout);
+	clearTimeout(options.PDUTimeout);
 
 	// Expected length is from packet sniffing - some applications may be different
 	if (data.readInt16BE(2) !== data.length || data.length < 27 || data[5] !== 0xf0 || data[4] + 1 + 12 + data.readInt16BE(13) !== (data.length - 4) || !(data[6] >> 7)) {
-		console.log('INVALID PDU RESPONSE or CONNECTION REFUSED - DISCONNECTING', 0, self.conx_ID);
-		console.log('TPKT Length From Header is ' + data.readInt16BE(2) + ' and RCV buffer length is ' + data.length + ' and COTP length is ' + data.readUInt8(4) + ' and data[6] is ' + data[6], 0, self.conx_ID);
+		console.log('INVALID PDU RESPONSE or CONNECTION REFUSED - DISCONNECTING', 0, options.connectionID);
+		console.log('TPKT Length From Header is ' + data.readInt16BE(2) + ' and RCV buffer length is ' + data.length + ' and COTP length is ' + data.readUInt8(4) + ' and data[6] is ' + data[6], 0, options.connectionID);
 		console.log(data);
-		self.isoclient.end();
+		options.isoclient.end();
 		setTimeout(function() {
-			self.connectNow.apply(self, arguments);
-		}, 2000, self.conx_params);
+			options.connectNow.apply(self, arguments);
+		}, 2000, options.connectionParams);
 		return null;
 	}
 
 	// Track the connection state
-	self.isoConnectionState = 4;  // 4 = Received PDU response, good to go
+	options.isoConnectionState = 4;  // 4 = Received PDU response, good to go
 
 	var partnerMaxParallel1 = data.readInt16BE(21);
 	var partnerMaxParallel2 = data.readInt16BE(23);
 	var partnerPDU = data.readInt16BE(25);
 
-	self.maxParallel = self.requestMaxParallel;
+	options.maxParallel = options.requestMaxParallel;
 
-	if (partnerMaxParallel1 < self.requestMaxParallel) {
-		self.maxParallel = partnerMaxParallel1;
+	if (partnerMaxParallel1 < options.requestMaxParallel) {
+		options.maxParallel = partnerMaxParallel1;
 	}
 
-	if (partnerMaxParallel2 < self.requestMaxParallel) {
-		self.maxParallel = partnerMaxParallel2;
+	if (partnerMaxParallel2 < options.requestMaxParallel) {
+		options.maxParallel = partnerMaxParallel2;
 	}
 
-	if (partnerPDU < self.requestMaxPDU) {
-		self.maxPDU = partnerPDU;
+	if (partnerPDU < options.requestMaxPDU) {
+		options.maxPDU = partnerPDU;
 	} else {
-		self.maxPDU = self.requestMaxPDU;
+		options.maxPDU = options.requestMaxPDU;
 	}
 
-	console.log('Received PDU Response - Proceeding with PDU ' + self.maxPDU + ' and ' + self.maxParallel + ' max parallel connections.', 0, self.conx_ID);
+	console.log('Received PDU Response - Proceeding with PDU ' + options.maxPDU + ' and ' + options.maxParallel + ' max parallel connections.', 0, options.connectionID);
 
-	self.isoclient.on('data', function() {
-		self.onResponse.apply(self, arguments);
+	options.isoclient.on('data', function() {
+		options.onResponse.apply(self, arguments);
 	});  // We need to make sure we don't add this event every time if we call it on data.
 
-	self.isoclient.on('error', function() {
-		self.readWriteError.apply(self, arguments);
-	});  // Might want to remove the self.connecterror listener
+	options.isoclient.on('error', function() {
+		options.readWriteError.apply(self, arguments);
+	});  // Might want to remove the options.connecterror listener
 
-	//self.isoclient.removeAllListeners('error');
+	//options.isoclient.removeAllListeners('error');
 
-	if ((!self.connectCBIssued) && (typeof (self.connectCallback) === "function")) {
-		self.connectCBIssued = true;
-		self.connectCallback();
+	if ((!options.connectCBIssued) && (typeof (options.connectCallback) === "function")) {
+		options.connectCBIssued = true;
+		options.connectCallback();
 	}
 
 }
@@ -357,176 +349,176 @@ NodeS7.prototype.onPDUReply = function(data) {
 
 NodeS7.prototype.writeItems = function(arg, value, cb) {
 	var self = this, i;
-	console.log("Preparing to WRITE " + arg + " to value " + value, 0, self.conx_ID);
-	if (self.isWriting()) {
-		console.log("You must wait until all previous writes have finished before scheduling another. ", 0, self.conx_ID);
+	console.log("Preparing to WRITE " + arg + " to value " + value, 0, options.connectionID);
+	if (options.isWriting()) {
+		console.log("You must wait until all previous writes have finished before scheduling another. ", 0, options.connectionID);
 		return;
 	}
 
 	if (typeof cb === "function") {
-		self.writeDoneCallback = cb;
+		options.writeDoneCallback = cb;
 	} else {
-		self.writeDoneCallback = doNothing;
+		options.writeDoneCallback = doNothing;
 	}
 
-	self.instantWriteBlockList = []; // Initialize the array.
+	options.instantWriteBlockList = []; // Initialize the array.
 
 	if (typeof arg === "string") {
-		self.instantWriteBlockList.push(stringToS7Addr(self.translationCB(arg), arg));
-		if (typeof (self.instantWriteBlockList[self.instantWriteBlockList.length - 1]) !== "undefined") {
-			self.instantWriteBlockList[self.instantWriteBlockList.length - 1].writeValue = value;
+		options.instantWriteBlockList.push(stringToS7Addr(options.translationCB(arg), arg));
+		if (typeof (options.instantWriteBlockList[options.instantWriteBlockList.length - 1]) !== "undefined") {
+			options.instantWriteBlockList[options.instantWriteBlockList.length - 1].writeValue = value;
 		}
 	} else if (Array.isArray(arg) && Array.isArray(value) && (arg.length == value.length)) {
 		for (i = 0; i < arg.length; i++) {
 			if (typeof arg[i] === "string") {
-				self.instantWriteBlockList.push(stringToS7Addr(self.translationCB(arg[i]), arg[i]));
-				if (typeof (self.instantWriteBlockList[self.instantWriteBlockList.length - 1]) !== "undefined") {
-					self.instantWriteBlockList[self.instantWriteBlockList.length - 1].writeValue = value[i];
+				options.instantWriteBlockList.push(stringToS7Addr(options.translationCB(arg[i]), arg[i]));
+				if (typeof (options.instantWriteBlockList[options.instantWriteBlockList.length - 1]) !== "undefined") {
+					options.instantWriteBlockList[options.instantWriteBlockList.length - 1].writeValue = value[i];
 				}
 			}
 		}
 	}
 
 	// Validity check.
-	for (i = self.instantWriteBlockList.length - 1; i >= 0; i--) {
-		if (self.instantWriteBlockList[i] === undefined) {
-			self.instantWriteBlockList.splice(i, 1);
+	for (i = options.instantWriteBlockList.length - 1; i >= 0; i--) {
+		if (options.instantWriteBlockList[i] === undefined) {
+			options.instantWriteBlockList.splice(i, 1);
 			console.log("Dropping an undefined write item.");
 		}
 	}
-	self.prepareWritePacket();
-	if (!self.isReading()) {
-		self.sendWritePacket();
+	options.prepareWritePacket();
+	if (!options.isReading()) {
+		options.sendWritePacket();
 	} else {
-		self.writeInQueue = true;
+		options.writeInQueue = true;
 	}
 }
 
 
 NodeS7.prototype.findItem = function(useraddr) {
 	var self = this, i;
-	var commstate = { value: self.isoConnectionState !== 4, quality: 'OK' };
+	var commstate = { value: options.isoConnectionState !== 4, quality: 'OK' };
 	if (useraddr === '_COMMERR') { return commstate; }
-	for (i = 0; i < self.polledReadBlockList.length; i++) {
-		if (self.polledReadBlockList[i].useraddr === useraddr) { return self.polledReadBlockList[i]; }
+	for (i = 0; i < options.polledReadBlockList.length; i++) {
+		if (options.polledReadBlockList[i].useraddr === useraddr) { return options.polledReadBlockList[i]; }
 	}
 	return undefined;
 }
 
 NodeS7.prototype.addItems = function(arg) {
 	var self = this;
-	self.addRemoveArray.push({ arg: arg, action: 'add' });
+	options.addRemoveArray.push({ arg: arg, action: 'add' });
 }
 
 NodeS7.prototype.addItemsNow = function(arg) {
 	var self = this, i;
-	console.log("Adding " + arg, 0, self.conx_ID);
+	console.log("Adding " + arg, 0, options.connectionID);
 	if (typeof (arg) === "string" && arg !== "_COMMERR") {
-		self.polledReadBlockList.push(stringToS7Addr(self.translationCB(arg), arg));
+		options.polledReadBlockList.push(stringToS7Addr(options.translationCB(arg), arg));
 	} else if (Array.isArray(arg)) {
 		for (i = 0; i < arg.length; i++) {
 			if (typeof (arg[i]) === "string" && arg[i] !== "_COMMERR") {
-				self.polledReadBlockList.push(stringToS7Addr(self.translationCB(arg[i]), arg[i]));
+				options.polledReadBlockList.push(stringToS7Addr(options.translationCB(arg[i]), arg[i]));
 			}
 		}
 	}
 
 	// Validity check.
-	for (i = self.polledReadBlockList.length - 1; i >= 0; i--) {
-		if (self.polledReadBlockList[i] === undefined) {
-			self.polledReadBlockList.splice(i, 1);
-			console.log("Dropping an undefined request item.", 0, self.conx_ID);
+	for (i = options.polledReadBlockList.length - 1; i >= 0; i--) {
+		if (options.polledReadBlockList[i] === undefined) {
+			options.polledReadBlockList.splice(i, 1);
+			console.log("Dropping an undefined request item.", 0, options.connectionID);
 		}
 	}
-	//	self.prepareReadPacket();
-	self.readPacketValid = false;
+	//	options.prepareReadPacket();
+	options.readPacketValid = false;
 }
 
 NodeS7.prototype.removeItems = function(arg) {
 	var self = this;
-	self.addRemoveArray.push({ arg: arg, action: 'remove' });
+	options.addRemoveArray.push({ arg: arg, action: 'remove' });
 }
 
 NodeS7.prototype.removeItemsNow = function(arg) {
 	var self = this, i;
 	if (typeof arg === "undefined") {
-		self.polledReadBlockList = [];
+		options.polledReadBlockList = [];
 	} else if (typeof arg === "string") {
-		for (i = 0; i < self.polledReadBlockList.length; i++) {
-			console.log('TCBA ' + self.translationCB(arg));
-			if (self.polledReadBlockList[i].addr === self.translationCB(arg)) {
+		for (i = 0; i < options.polledReadBlockList.length; i++) {
+			console.log('TCBA ' + options.translationCB(arg));
+			if (options.polledReadBlockList[i].addr === options.translationCB(arg)) {
 				console.log('Splicing');
-				self.polledReadBlockList.splice(i, 1);
+				options.polledReadBlockList.splice(i, 1);
 			}
 		}
 	} else if (Array.isArray(arg)) {
-		for (i = 0; i < self.polledReadBlockList.length; i++) {
+		for (i = 0; i < options.polledReadBlockList.length; i++) {
 			for (var j = 0; j < arg.length; j++) {
-				if (self.polledReadBlockList[i].addr === self.translationCB(arg[j])) {
-					self.polledReadBlockList.splice(i, 1);
+				if (options.polledReadBlockList[i].addr === options.translationCB(arg[j])) {
+					options.polledReadBlockList.splice(i, 1);
 				}
 			}
 		}
 	}
-	self.readPacketValid = false;
-	//	self.prepareReadPacket();
+	options.readPacketValid = false;
+	//	options.prepareReadPacket();
 }
 
 NodeS7.prototype.readAllItems = function(arg) {
 	var self = this;
 
-	console.log("Reading All Items (readAllItems was called)", 1, self.conx_ID);
+	console.log("Reading All Items (readAllItems was called)", 1, options.connectionID);
 
 	if (typeof arg === "function") {
-		self.readDoneCallback = arg;
+		options.readDoneCallback = arg;
 	} else {
-		self.readDoneCallback = doNothing;
+		options.readDoneCallback = doNothing;
 	}
 
-	if (self.isoConnectionState !== 4) {
-		console.log("Unable to read when not connected. Return bad values.", 0, self.conx_ID);
+	if (options.isoConnectionState !== 4) {
+		console.log("Unable to read when not connected. Return bad values.", 0, options.connectionID);
 	} // For better behaviour when auto-reconnecting - don't return now
 
 	// Check if ALL are done...  You might think we could look at parallel jobs, and for the most part we can, but if one just finished and we end up here before starting another, it's bad.
-	if (self.isWaiting()) {
-		console.log("Waiting to read for all R/W operations to complete.  Will re-trigger readAllItems in 100ms.", 0, self.conx_ID);
+	if (options.isWaiting()) {
+		console.log("Waiting to read for all R/W operations to complete.  Will re-trigger readAllItems in 100ms.", 0, options.connectionID);
 		setTimeout(function() {
-			self.readAllItems.apply(self, arguments);
+			options.readAllItems.apply(self, arguments);
 		}, 100, arg);
 		return;
 	}
 
 	// Now we check the array of adding and removing things.  Only now is it really safe to do this.
-	self.addRemoveArray.forEach(function(element) {
-		console.log('Adding or Removing ' + util.format(element), 1, self.conx_ID);
+	options.addRemoveArray.forEach(function(element) {
+		console.log('Adding or Removing ' + util.format(element), 1, options.connectionID);
 		if (element.action === 'remove') {
-			self.removeItemsNow(element.arg);
+			options.removeItemsNow(element.arg);
 		}
 		if (element.action === 'add') {
-			self.addItemsNow(element.arg);
+			options.addItemsNow(element.arg);
 		}
 	});
 
-	self.addRemoveArray = []; // Clear for next time.
+	options.addRemoveArray = []; // Clear for next time.
 
-	if (!self.readPacketValid) { self.prepareReadPacket(); }
+	if (!options.readPacketValid) { options.prepareReadPacket(); }
 
 	// ideally...  incrementSequenceNumbers();
 
-	console.log("Calling SRP from RAI", 1, self.conx_ID);
-	self.sendReadPacket(); // Note this sends the first few read packets depending on parallel connection restrictions.
+	console.log("Calling SRP from RAI", 1, options.connectionID);
+	options.sendReadPacket(); // Note this sends the first few read packets depending on parallel connection restrictions.
 }
 
 NodeS7.prototype.isWaiting = function() {
 	var self = this;
-	return (self.isReading() || self.isWriting());
+	return (options.isReading() || options.isWriting());
 }
 
 NodeS7.prototype.isReading = function() {
 	var self = this, i;
 	// Walk through the array and if any packets are marked as sent, it means we haven't received our final confirmation.
-	for (i = 0; i < self.readPacketArray.length; i++) {
-		if (self.readPacketArray[i].sent === true) { return true }
+	for (i = 0; i < options.readPacketArray.length; i++) {
+		if (options.readPacketArray[i].sent === true) { return true }
 	}
 	return false;
 }
@@ -534,8 +526,8 @@ NodeS7.prototype.isReading = function() {
 NodeS7.prototype.isWriting = function() {
 	var self = this, i;
 	// Walk through the array and if any packets are marked as sent, it means we haven't received our final confirmation.
-	for (i = 0; i < self.writePacketArray.length; i++) {
-		if (self.writePacketArray[i].sent === true) { return true }
+	for (i = 0; i < options.writePacketArray.length; i++) {
+		if (options.writePacketArray[i].sent === true) { return true }
 	}
 	return false;
 }
@@ -543,29 +535,29 @@ NodeS7.prototype.isWriting = function() {
 
 NodeS7.prototype.clearReadPacketTimeouts = function() {
 	var self = this, i;
-	console.log('Clearing read PacketTimeouts', 1, self.conx_ID);
-	// Before we initialize the self.readPacketArray, we need to loop through all of them and clear timeouts.
-	for (i = 0; i < self.readPacketArray.length; i++) {
-		clearTimeout(self.readPacketArray[i].timeout);
-		self.readPacketArray[i].sent = false;
-		self.readPacketArray[i].rcvd = false;
+	console.log('Clearing read PacketTimeouts', 1, options.connectionID);
+	// Before we initialize the options.readPacketArray, we need to loop through all of them and clear timeouts.
+	for (i = 0; i < options.readPacketArray.length; i++) {
+		clearTimeout(options.readPacketArray[i].timeout);
+		options.readPacketArray[i].sent = false;
+		options.readPacketArray[i].rcvd = false;
 	}
 }
 
 NodeS7.prototype.clearWritePacketTimeouts = function() {
 	var self = this, i;
-	console.log('Clearing write PacketTimeouts', 1, self.conx_ID);
-	// Before we initialize the self.readPacketArray, we need to loop through all of them and clear timeouts.
-	for (i = 0; i < self.writePacketArray.length; i++) {
-		clearTimeout(self.writePacketArray[i].timeout);
-		self.writePacketArray[i].sent = false;
-		self.writePacketArray[i].rcvd = false;
+	console.log('Clearing write PacketTimeouts', 1, options.connectionID);
+	// Before we initialize the options.readPacketArray, we need to loop through all of them and clear timeouts.
+	for (i = 0; i < options.writePacketArray.length; i++) {
+		clearTimeout(options.writePacketArray[i].timeout);
+		options.writePacketArray[i].sent = false;
+		options.writePacketArray[i].rcvd = false;
 	}
 }
 
 NodeS7.prototype.prepareWritePacket = function() {
 	var self = this, i;
-	var itemList = self.instantWriteBlockList;
+	var itemList = options.instantWriteBlockList;
 	var requestList = [];			// The request list consists of the block list, split into chunks readable by PDU.
 	var requestNumber = 0;
 
@@ -578,53 +570,53 @@ NodeS7.prototype.prepareWritePacket = function() {
 	}
 
 	// Reinitialize the WriteBlockList
-	self.globalWriteBlockList = [];
+	options.globalWriteBlockList = [];
 
 	// At this time we do not do write optimizations.
 	// The reason for this is it is would cause numerous issues depending how the code was written in the PLC.
 	// If we write M0.1 and M0.2 then to optimize we would have to write MB0, which also writes 0.0, 0.3, 0.4...
 	//
 	// I suppose when working with integers, if we write MW0 and MW2, we could write these as one block.
-	// But if you really, really want the program to do that, write an array yourself.
-	self.globalWriteBlockList[0] = itemList[0];
-	self.globalWriteBlockList[0].itemReference = [];
-	self.globalWriteBlockList[0].itemReference.push(itemList[0]);
+	// But if you really, really want the program to do that, write an array youroptions.
+	options.globalWriteBlockList[0] = itemList[0];
+	options.globalWriteBlockList[0].itemReference = [];
+	options.globalWriteBlockList[0].itemReference.push(itemList[0]);
 
 	var thisBlock = 0;
 	itemList[0].block = thisBlock;
-	var maxByteRequest = 4 * Math.floor((self.maxPDU - 18 - 12) / 4);  // Absolutely must not break a real array into two requests.  Maybe we can extend by two bytes when not DINT/REAL/INT.
+	var maxByteRequest = 4 * Math.floor((options.maxPDU - 18 - 12) / 4);  // Absolutely must not break a real array into two requests.  Maybe we can extend by two bytes when not DINT/REAL/INT.
 	//	console.log("Max Write Length is " + maxByteRequest);
 
 	// Just push the items into blocks and figure out the write buffers
 	for (i = 0; i < itemList.length; i++) {
-		self.globalWriteBlockList[i] = itemList[i]; // Remember - by reference.
-		self.globalWriteBlockList[i].isOptimized = false;
-		self.globalWriteBlockList[i].itemReference = [];
-		self.globalWriteBlockList[i].itemReference.push(itemList[i]);
+		options.globalWriteBlockList[i] = itemList[i]; // Remember - by reference.
+		options.globalWriteBlockList[i].isOptimized = false;
+		options.globalWriteBlockList[i].itemReference = [];
+		options.globalWriteBlockList[i].itemReference.push(itemList[i]);
 		bufferizeS7Item(itemList[i]);
 	}
 
 	var thisRequest = 0;
 
 	// Split the blocks into requests, if they're too large.
-	for (i = 0; i < self.globalWriteBlockList.length; i++) {
-		var startByte = self.globalWriteBlockList[i].offset;
-		var remainingLength = self.globalWriteBlockList[i].byteLength;
+	for (i = 0; i < options.globalWriteBlockList.length; i++) {
+		var startByte = options.globalWriteBlockList[i].offset;
+		var remainingLength = options.globalWriteBlockList[i].byteLength;
 		var lengthOffset = 0;
 
-		// Always create a request for a self.globalReadBlockList.
-		requestList[thisRequest] = self.globalWriteBlockList[i].clone();
+		// Always create a request for a options.globalReadBlockList.
+		requestList[thisRequest] = options.globalWriteBlockList[i].clone();
 
 		// How many parts?
-		self.globalWriteBlockList[i].parts = Math.ceil(self.globalWriteBlockList[i].byteLength / maxByteRequest);
-		//		console.log("self.globalWriteBlockList " + i + " parts is " + self.globalWriteBlockList[i].parts + " offset is " + self.globalWriteBlockList[i].offset + " MBR is " + maxByteRequest);
+		options.globalWriteBlockList[i].parts = Math.ceil(options.globalWriteBlockList[i].byteLength / maxByteRequest);
+		//		console.log("options.globalWriteBlockList " + i + " parts is " + options.globalWriteBlockList[i].parts + " offset is " + options.globalWriteBlockList[i].offset + " MBR is " + maxByteRequest);
 
-		self.globalWriteBlockList[i].requestReference = [];
+		options.globalWriteBlockList[i].requestReference = [];
 
 		// If we're optimized...
-		for (var j = 0; j < self.globalWriteBlockList[i].parts; j++) {
-			requestList[thisRequest] = self.globalWriteBlockList[i].clone();
-			self.globalWriteBlockList[i].requestReference.push(requestList[thisRequest]);
+		for (var j = 0; j < options.globalWriteBlockList[i].parts; j++) {
+			requestList[thisRequest] = options.globalWriteBlockList[i].clone();
+			options.globalWriteBlockList[i].requestReference.push(requestList[thisRequest]);
 			requestList[thisRequest].offset = startByte;
 			requestList[thisRequest].byteLength = Math.min(maxByteRequest, remainingLength);
 			requestList[thisRequest].byteLengthWithFill = requestList[thisRequest].byteLength;
@@ -632,14 +624,14 @@ NodeS7.prototype.prepareWritePacket = function() {
 
 			// max
 
-			requestList[thisRequest].writeBuffer = self.globalWriteBlockList[i].writeBuffer.slice(lengthOffset, lengthOffset + requestList[thisRequest].byteLengthWithFill);
-			requestList[thisRequest].writeQualityBuffer = self.globalWriteBlockList[i].writeQualityBuffer.slice(lengthOffset, lengthOffset + requestList[thisRequest].byteLengthWithFill);
-			lengthOffset += self.globalWriteBlockList[i].requestReference[j].byteLength;
+			requestList[thisRequest].writeBuffer = options.globalWriteBlockList[i].writeBuffer.slice(lengthOffset, lengthOffset + requestList[thisRequest].byteLengthWithFill);
+			requestList[thisRequest].writeQualityBuffer = options.globalWriteBlockList[i].writeQualityBuffer.slice(lengthOffset, lengthOffset + requestList[thisRequest].byteLengthWithFill);
+			lengthOffset += options.globalWriteBlockList[i].requestReference[j].byteLength;
 
-			if (self.globalWriteBlockList[i].parts > 1) {
+			if (options.globalWriteBlockList[i].parts > 1) {
 				requestList[thisRequest].datatype = 'BYTE';
 				requestList[thisRequest].dtypelen = 1;
-				requestList[thisRequest].arrayLength = requestList[thisRequest].byteLength;//self.globalReadBlockList[thisBlock].byteLength;		(This line shouldn't be needed anymore - shouldn't matter)
+				requestList[thisRequest].arrayLength = requestList[thisRequest].byteLength;//options.globalReadBlockList[thisBlock].byteLength;		(This line shouldn't be needed anymore - shouldn't matter)
 			}
 			remainingLength -= maxByteRequest;
 			thisRequest++;
@@ -647,43 +639,43 @@ NodeS7.prototype.prepareWritePacket = function() {
 		}
 	}
 
-	self.clearWritePacketTimeouts();
-	self.writePacketArray = [];
+	options.clearWritePacketTimeouts();
+	options.writePacketArray = [];
 
-	//	console.log("GWBL is " + self.globalWriteBlockList.length);
+	//	console.log("GWBL is " + options.globalWriteBlockList.length);
 
 
-	// Before we initialize the self.writePacketArray, we need to loop through all of them and clear timeouts.
+	// Before we initialize the options.writePacketArray, we need to loop through all of them and clear timeouts.
 
 	// The packetizer...
 	while (requestNumber < requestList.length) {
 		// Set up the read packet
 		// Yes this is the same master sequence number shared with the read queue
-		self.masterSequenceNumber += 1;
-		if (self.masterSequenceNumber > 32767) {
-			self.masterSequenceNumber = 1;
+		options.masterSequenceNumber += 1;
+		if (options.masterSequenceNumber > 32767) {
+			options.masterSequenceNumber = 1;
 		}
 
 		var numItems = 0;
 
 		// Maybe this shouldn't really be here?
-		self.writeReqHeader.copy(self.writeReq, 0);
+		options.writeReqHeader.copy(options.writeReq, 0);
 
 		// Packet's length
 		var packetWriteLength = 10 + 4;  // 10 byte header and 4 byte param header
 
-		self.writePacketArray.push(new S7Packet());
-		var thisPacketNumber = self.writePacketArray.length - 1;
-		self.writePacketArray[thisPacketNumber].seqNum = self.masterSequenceNumber;
-		//		console.log("Write Sequence Number is " + self.writePacketArray[thisPacketNumber].seqNum);
+		options.writePacketArray.push(new S7Packet());
+		var thisPacketNumber = options.writePacketArray.length - 1;
+		options.writePacketArray[thisPacketNumber].seqNum = options.masterSequenceNumber;
+		//		console.log("Write Sequence Number is " + options.writePacketArray[thisPacketNumber].seqNum);
 
-		self.writePacketArray[thisPacketNumber].itemList = [];  // Initialize as array.
+		options.writePacketArray[thisPacketNumber].itemList = [];  // Initialize as array.
 
 		for (i = requestNumber; i < requestList.length; i++) {
 			//console.log("Number is " + (requestList[i].byteLengthWithFill + 4 + packetReplyLength));
-			if (requestList[i].byteLengthWithFill + 12 + 4 + packetWriteLength > self.maxPDU) { // 12 byte header for each item and 4 bytes for the data header
+			if (requestList[i].byteLengthWithFill + 12 + 4 + packetWriteLength > options.maxPDU) { // 12 byte header for each item and 4 bytes for the data header
 				if (numItems === 0) {
-					console.log("breaking when we shouldn't, byte length with fill is  " + requestList[i].byteLengthWithFill + " max byte request " + maxByteRequest, 0, self.conx_ID);
+					console.log("breaking when we shouldn't, byte length with fill is  " + requestList[i].byteLengthWithFill + " max byte request " + maxByteRequest, 0, options.connectionID);
 					throw new Error("Somehow write request didn't split properly - exiting.  Report this as a bug.");
 				}
 				break;  // We can't fit this packet in here.
@@ -692,13 +684,13 @@ NodeS7.prototype.prepareWritePacket = function() {
 			numItems++;
 			packetWriteLength += (requestList[i].byteLengthWithFill + 12 + 4); // Don't forget each request has a 12 byte header as well.
 			//console.log('I is ' + i + ' Addr Type is ' + requestList[i].addrtype + ' and type is ' + requestList[i].datatype + ' and DBNO is ' + requestList[i].dbNumber + ' and offset is ' + requestList[i].offset + ' bit ' + requestList[i].bitOffset + ' len ' + requestList[i].arrayLength);
-			//S7AddrToBuffer(requestList[i]).copy(self.writeReq, 19 + numItems * 12);  // i or numItems?  used to be i.
+			//S7AddrToBuffer(requestList[i]).copy(options.writeReq, 19 + numItems * 12);  // i or numItems?  used to be i.
 			//itemBuffer = bufferizeS7Packet(requestList[i]);
 			//itemBuffer.copy(dataBuffer, dataBufferPointer);
 			//dataBufferPointer += itemBuffer.length;
-			self.writePacketArray[thisPacketNumber].itemList.push(requestList[i]);
+			options.writePacketArray[thisPacketNumber].itemList.push(requestList[i]);
 		}
-		//		dataBuffer.copy(self.writeReq, 19 + (numItems + 1) * 12, 0, dataBufferPointer - 1);
+		//		dataBuffer.copy(options.writeReq, 19 + (numItems + 1) * 12, 0, dataBufferPointer - 1);
 	}
 }
 
@@ -712,16 +704,16 @@ NodeS7.prototype.prepareReadPacket = function() {
 	// Then you have a 4 byte "item header" PER ITEM.
 	// So you have overhead of 18 bytes for one item, 22 bytes for two items, 26 bytes for 3 and so on.  So for example you can request 240 - 22 = 218 bytes for two items.
 
-	// We can calculate a max byte length for single request as 4*Math.floor((self.maxPDU - 18)/4) - to ensure we don't cross boundaries.
+	// We can calculate a max byte length for single request as 4*Math.floor((options.maxPDU - 18)/4) - to ensure we don't cross boundaries.
 
-	var itemList = self.polledReadBlockList;				// The items are the actual items requested by the user
+	var itemList = options.polledReadBlockList;				// The items are the actual items requested by the user
 	var requestList = [];						// The request list consists of the block list, split into chunks readable by PDU.
 
 	// Validity check.
 	for (i = itemList.length - 1; i >= 0; i--) {
 		if (itemList[i] === undefined) {
 			itemList.splice(i, 1);
-			console.log("Dropping an undefined request item.", 0, self.conx_ID);
+			console.log("Dropping an undefined request item.", 0, options.connectionID);
 		}
 	}
 
@@ -733,54 +725,54 @@ NodeS7.prototype.prepareReadPacket = function() {
 		return undefined;
 	}
 
-	self.globalReadBlockList = [];
+	options.globalReadBlockList = [];
 
 	// ...because you have to start your optimization somewhere.
-	self.globalReadBlockList[0] = itemList[0];
-	self.globalReadBlockList[0].itemReference = [];
-	self.globalReadBlockList[0].itemReference.push(itemList[0]);
+	options.globalReadBlockList[0] = itemList[0];
+	options.globalReadBlockList[0].itemReference = [];
+	options.globalReadBlockList[0].itemReference.push(itemList[0]);
 
 	var thisBlock = 0;
 	itemList[0].block = thisBlock;
-	var maxByteRequest = 4 * Math.floor((self.maxPDU - 18) / 4);  // Absolutely must not break a real array into two requests.  Maybe we can extend by two bytes when not DINT/REAL/INT.
+	var maxByteRequest = 4 * Math.floor((options.maxPDU - 18) / 4);  // Absolutely must not break a real array into two requests.  Maybe we can extend by two bytes when not DINT/REAL/INT.
 
 	// Optimize the items into blocks
 	for (i = 1; i < itemList.length; i++) {
 		// Skip T, C, P types
-		if ((itemList[i].areaS7Code !== self.globalReadBlockList[thisBlock].areaS7Code) ||   	// Can't optimize between areas
-			(itemList[i].dbNumber !== self.globalReadBlockList[thisBlock].dbNumber) ||			// Can't optimize across DBs
-			(!self.isOptimizableArea(itemList[i].areaS7Code)) || 					// Can't optimize T,C (I don't think) and definitely not P.
-			((itemList[i].offset - self.globalReadBlockList[thisBlock].offset + itemList[i].byteLength) > maxByteRequest) ||      	// If this request puts us over our max byte length, create a new block for consistency reasons.
-			(itemList[i].offset - (self.globalReadBlockList[thisBlock].offset + self.globalReadBlockList[thisBlock].byteLength) > self.maxGap)) {		// If our gap is large, create a new block.
+		if ((itemList[i].areaS7Code !== options.globalReadBlockList[thisBlock].areaS7Code) ||   	// Can't optimize between areas
+			(itemList[i].dbNumber !== options.globalReadBlockList[thisBlock].dbNumber) ||			// Can't optimize across DBs
+			(!options.isOptimizableArea(itemList[i].areaS7Code)) || 					// Can't optimize T,C (I don't think) and definitely not P.
+			((itemList[i].offset - options.globalReadBlockList[thisBlock].offset + itemList[i].byteLength) > maxByteRequest) ||      	// If this request puts us over our max byte length, create a new block for consistency reasons.
+			(itemList[i].offset - (options.globalReadBlockList[thisBlock].offset + options.globalReadBlockList[thisBlock].byteLength) > options.maxGap)) {		// If our gap is large, create a new block.
 			// At this point we give up and create a new block.
 			thisBlock = thisBlock + 1;
-			self.globalReadBlockList[thisBlock] = itemList[i]; // By reference.
+			options.globalReadBlockList[thisBlock] = itemList[i]; // By reference.
 			//				itemList[i].block = thisBlock; // Don't need to do this.
-			self.globalReadBlockList[thisBlock].isOptimized = false;
-			self.globalReadBlockList[thisBlock].itemReference = [];
-			self.globalReadBlockList[thisBlock].itemReference.push(itemList[i]);
+			options.globalReadBlockList[thisBlock].isOptimized = false;
+			options.globalReadBlockList[thisBlock].itemReference = [];
+			options.globalReadBlockList[thisBlock].itemReference.push(itemList[i]);
 		} else {
-			console.log("Attempting optimization of item " + itemList[i].addr + " with " + self.globalReadBlockList[thisBlock].addr, 0, self.conx_ID);
+			console.log("Attempting optimization of item " + itemList[i].addr + " with " + options.globalReadBlockList[thisBlock].addr, 0, options.connectionID);
 			// This next line checks the maximum.
 			// Think of this situation - we have a large request of 40 bytes starting at byte 10.
 			//	Then someone else wants one byte starting at byte 12.  The block length doesn't change.
 			//
 			// But if we had 40 bytes starting at byte 10 (which gives us byte 10-49) and we want byte 50, our byte length is 50-10 + 1 = 41.
-			self.globalReadBlockList[thisBlock].byteLength = Math.max(self.globalReadBlockList[thisBlock].byteLength, itemList[i].offset - self.globalReadBlockList[thisBlock].offset + itemList[i].byteLength);
+			options.globalReadBlockList[thisBlock].byteLength = Math.max(options.globalReadBlockList[thisBlock].byteLength, itemList[i].offset - options.globalReadBlockList[thisBlock].offset + itemList[i].byteLength);
 
 			// Point the buffers (byte and quality) to a sliced version of the optimized block.  This is by reference (same area of memory)
-			itemList[i].byteBuffer = self.globalReadBlockList[thisBlock].byteBuffer.slice(itemList[i].offset - self.globalReadBlockList[thisBlock].offset, itemList[i].offset - self.globalReadBlockList[thisBlock].offset + itemList[i].byteLength);
-			itemList[i].qualityBuffer = self.globalReadBlockList[thisBlock].qualityBuffer.slice(itemList[i].offset - self.globalReadBlockList[thisBlock].offset, itemList[i].offset - self.globalReadBlockList[thisBlock].offset + itemList[i].byteLength);
+			itemList[i].byteBuffer = options.globalReadBlockList[thisBlock].byteBuffer.slice(itemList[i].offset - options.globalReadBlockList[thisBlock].offset, itemList[i].offset - options.globalReadBlockList[thisBlock].offset + itemList[i].byteLength);
+			itemList[i].qualityBuffer = options.globalReadBlockList[thisBlock].qualityBuffer.slice(itemList[i].offset - options.globalReadBlockList[thisBlock].offset, itemList[i].offset - options.globalReadBlockList[thisBlock].offset + itemList[i].byteLength);
 
 			// For now, change the request type here, and fill in some other things.
 
 			// I am not sure we want to do these next two steps.
 			// It seems like things get screwed up when we do this.
-			// Since self.globalReadBlockList[thisBlock] exists already at this point, and our buffer is already set, let's not do this now.
-			// self.globalReadBlockList[thisBlock].datatype = 'BYTE';
-			// self.globalReadBlockList[thisBlock].dtypelen = 1;
-			self.globalReadBlockList[thisBlock].isOptimized = true;
-			self.globalReadBlockList[thisBlock].itemReference.push(itemList[i]);
+			// Since options.globalReadBlockList[thisBlock] exists already at this point, and our buffer is already set, let's not do this now.
+			// options.globalReadBlockList[thisBlock].datatype = 'BYTE';
+			// options.globalReadBlockList[thisBlock].dtypelen = 1;
+			options.globalReadBlockList[thisBlock].isOptimized = true;
+			options.globalReadBlockList[thisBlock].itemReference.push(itemList[i]);
 		}
 	}
 
@@ -789,33 +781,33 @@ NodeS7.prototype.prepareReadPacket = function() {
 	//	console.log("Preparing the read packet...");
 
 	// Split the blocks into requests, if they're too large.
-	for (i = 0; i < self.globalReadBlockList.length; i++) {
-		// Always create a request for a self.globalReadBlockList.
-		requestList[thisRequest] = self.globalReadBlockList[i].clone();
+	for (i = 0; i < options.globalReadBlockList.length; i++) {
+		// Always create a request for a options.globalReadBlockList.
+		requestList[thisRequest] = options.globalReadBlockList[i].clone();
 
 		// How many parts?
-		self.globalReadBlockList[i].parts = Math.ceil(self.globalReadBlockList[i].byteLength / maxByteRequest);
-		console.log("self.globalReadBlockList " + i + " parts is " + self.globalReadBlockList[i].parts + " offset is " + self.globalReadBlockList[i].offset + " MBR is " + maxByteRequest, 1, self.conx_ID);
-		var startByte = self.globalReadBlockList[i].offset;
-		var remainingLength = self.globalReadBlockList[i].byteLength;
+		options.globalReadBlockList[i].parts = Math.ceil(options.globalReadBlockList[i].byteLength / maxByteRequest);
+		console.log("options.globalReadBlockList " + i + " parts is " + options.globalReadBlockList[i].parts + " offset is " + options.globalReadBlockList[i].offset + " MBR is " + maxByteRequest, 1, options.connectionID);
+		var startByte = options.globalReadBlockList[i].offset;
+		var remainingLength = options.globalReadBlockList[i].byteLength;
 
-		self.globalReadBlockList[i].requestReference = [];
+		options.globalReadBlockList[i].requestReference = [];
 
 		// If we're optimized...
-		for (var j = 0; j < self.globalReadBlockList[i].parts; j++) {
-			requestList[thisRequest] = self.globalReadBlockList[i].clone();
-			self.globalReadBlockList[i].requestReference.push(requestList[thisRequest]);
-			//console.log(self.globalReadBlockList[i]);
-			//console.log(self.globalReadBlockList.slice(i,i+1));
+		for (var j = 0; j < options.globalReadBlockList[i].parts; j++) {
+			requestList[thisRequest] = options.globalReadBlockList[i].clone();
+			options.globalReadBlockList[i].requestReference.push(requestList[thisRequest]);
+			//console.log(options.globalReadBlockList[i]);
+			//console.log(options.globalReadBlockList.slice(i,i+1));
 			requestList[thisRequest].offset = startByte;
 			requestList[thisRequest].byteLength = Math.min(maxByteRequest, remainingLength);
 			requestList[thisRequest].byteLengthWithFill = requestList[thisRequest].byteLength;
 			if (requestList[thisRequest].byteLengthWithFill % 2) { requestList[thisRequest].byteLengthWithFill += 1; }
 			// Just for now...
-			if (self.globalReadBlockList[i].parts > 1) {
+			if (options.globalReadBlockList[i].parts > 1) {
 				requestList[thisRequest].datatype = 'BYTE';
 				requestList[thisRequest].dtypelen = 1;
-				requestList[thisRequest].arrayLength = requestList[thisRequest].byteLength;//self.globalReadBlockList[thisBlock].byteLength;
+				requestList[thisRequest].arrayLength = requestList[thisRequest].byteLength;//options.globalReadBlockList[thisBlock].byteLength;
 			}
 			remainingLength -= maxByteRequest;
 			thisRequest++;
@@ -824,39 +816,39 @@ NodeS7.prototype.prepareReadPacket = function() {
 	}
 
 	//requestList[5].offset = 243;
-	//	requestList = self.globalReadBlockList;
+	//	requestList = options.globalReadBlockList;
 
 	// The packetizer...
 	var requestNumber = 0;
 
-	self.clearReadPacketTimeouts();
-	self.readPacketArray = [];
+	options.clearReadPacketTimeouts();
+	options.readPacketArray = [];
 
 	while (requestNumber < requestList.length) {
 		// Set up the read packet
-		self.masterSequenceNumber += 1;
-		if (self.masterSequenceNumber > 32767) {
-			self.masterSequenceNumber = 1;
+		options.masterSequenceNumber += 1;
+		if (options.masterSequenceNumber > 32767) {
+			options.masterSequenceNumber = 1;
 		}
 
 		var numItems = 0;
-		self.readReqHeader.copy(self.readReq, 0);
+		options.readReqHeader.copy(options.readReq, 0);
 
 		// Packet's expected reply length
 		var packetReplyLength = 12 + 2;  //
 
-		self.readPacketArray.push(new S7Packet());
-		var thisPacketNumber = self.readPacketArray.length - 1;
-		self.readPacketArray[thisPacketNumber].seqNum = self.masterSequenceNumber;
-		console.log("Sequence Number is " + self.readPacketArray[thisPacketNumber].seqNum, 1, self.conx_ID);
+		options.readPacketArray.push(new S7Packet());
+		var thisPacketNumber = options.readPacketArray.length - 1;
+		options.readPacketArray[thisPacketNumber].seqNum = options.masterSequenceNumber;
+		console.log("Sequence Number is " + options.readPacketArray[thisPacketNumber].seqNum, 1, options.connectionID);
 
-		self.readPacketArray[thisPacketNumber].itemList = [];  // Initialize as array.
+		options.readPacketArray[thisPacketNumber].itemList = [];  // Initialize as array.
 
 		for (i = requestNumber; i < requestList.length; i++) {
 			//console.log("Number is " + (requestList[i].byteLengthWithFill + 4 + packetReplyLength));
-			if (requestList[i].byteLengthWithFill + 4 + packetReplyLength > self.maxPDU) {
+			if (requestList[i].byteLengthWithFill + 4 + packetReplyLength > options.maxPDU) {
 				if (numItems === 0) {
-					console.log("breaking when we shouldn't, rlibl " + requestList[i].byteLengthWithFill + " MBR " + maxByteRequest, 0, self.conx_ID);
+					console.log("breaking when we shouldn't, rlibl " + requestList[i].byteLengthWithFill + " MBR " + maxByteRequest, 0, options.connectionID);
 					throw new Error("Somehow write request didn't split properly - exiting.  Report this as a bug.");
 				}
 				break;  // We can't fit this packet in here.
@@ -865,72 +857,72 @@ NodeS7.prototype.prepareReadPacket = function() {
 			numItems++;
 			packetReplyLength += (requestList[i].byteLengthWithFill + 4);
 			//console.log('I is ' + i + ' Addr Type is ' + requestList[i].addrtype + ' and type is ' + requestList[i].datatype + ' and DBNO is ' + requestList[i].dbNumber + ' and offset is ' + requestList[i].offset + ' bit ' + requestList[i].bitOffset + ' len ' + requestList[i].arrayLength);
-			// skip this for now S7AddrToBuffer(requestList[i]).copy(self.readReq, 19 + numItems * 12);  // i or numItems?
-			self.readPacketArray[thisPacketNumber].itemList.push(requestList[i]);
+			// skip this for now S7AddrToBuffer(requestList[i]).copy(options.readReq, 19 + numItems * 12);  // i or numItems?
+			options.readPacketArray[thisPacketNumber].itemList.push(requestList[i]);
 		}
 	}
-	self.readPacketValid = true;
+	options.readPacketValid = true;
 }
 
 NodeS7.prototype.sendReadPacket = function() {
 	var self = this, i, j, flagReconnect = false;
 
-	console.log("SendReadPacket called", 1, self.conx_ID);
+	console.log("SendReadPacket called", 1, options.connectionID);
 
-	for (i = 0; i < self.readPacketArray.length; i++) {
-		if (self.readPacketArray[i].sent) { continue; }
-		if (self.parallelJobsNow >= self.maxParallel) { continue; }
+	for (i = 0; i < options.readPacketArray.length; i++) {
+		if (options.readPacketArray[i].sent) { continue; }
+		if (options.parallelJobsNow >= options.maxParallel) { continue; }
 		// From here down is SENDING the packet
-		self.readPacketArray[i].reqTime = process.hrtime();
-		self.readReq.writeUInt8(self.readPacketArray[i].itemList.length, 18);
-		self.readReq.writeUInt16BE(19 + self.readPacketArray[i].itemList.length * 12, 2); // buffer length
-		self.readReq.writeUInt16BE(self.readPacketArray[i].seqNum, 11);
-		self.readReq.writeUInt16BE(self.readPacketArray[i].itemList.length * 12 + 2, 13); // Parameter length - 14 for one read, 28 for 2.
+		options.readPacketArray[i].reqTime = process.hrtime();
+		options.readReq.writeUInt8(options.readPacketArray[i].itemList.length, 18);
+		options.readReq.writeUInt16BE(19 + options.readPacketArray[i].itemList.length * 12, 2); // buffer length
+		options.readReq.writeUInt16BE(options.readPacketArray[i].seqNum, 11);
+		options.readReq.writeUInt16BE(options.readPacketArray[i].itemList.length * 12 + 2, 13); // Parameter length - 14 for one read, 28 for 2.
 
-		for (j = 0; j < self.readPacketArray[i].itemList.length; j++) {
-			S7AddrToBuffer(self.readPacketArray[i].itemList[j], false).copy(self.readReq, 19 + j * 12);
+		for (j = 0; j < options.readPacketArray[i].itemList.length; j++) {
+			S7AddrToBuffer(options.readPacketArray[i].itemList[j], false).copy(options.readReq, 19 + j * 12);
 		}
 
-		if (self.isoConnectionState == 4) {
-			self.readPacketArray[i].timeout = setTimeout(function() {
-				self.packetTimeout.apply(self, arguments);
-			}, self.globalTimeout, "read", self.readPacketArray[i].seqNum);
-			self.isoclient.write(self.readReq.slice(0, 19 + self.readPacketArray[i].itemList.length * 12));  // was 31
-			self.readPacketArray[i].sent = true;
-			self.readPacketArray[i].rcvd = false;
-			self.readPacketArray[i].timeoutError = false;
-			self.parallelJobsNow += 1;
+		if (options.isoConnectionState == 4) {
+			options.readPacketArray[i].timeout = setTimeout(function() {
+				options.packetTimeout.apply(self, arguments);
+			}, options.globalTimeout, "read", options.readPacketArray[i].seqNum);
+			options.isoclient.write(options.readReq.slice(0, 19 + options.readPacketArray[i].itemList.length * 12));  // was 31
+			options.readPacketArray[i].sent = true;
+			options.readPacketArray[i].rcvd = false;
+			options.readPacketArray[i].timeoutError = false;
+			options.parallelJobsNow += 1;
 		} else {
-			//			console.log('Somehow got into read block without proper self.isoConnectionState of 3.  Disconnect.');
-			//			self.isoclient.end();
+			//			console.log('Somehow got into read block without proper options.isoConnectionState of 3.  Disconnect.');
+			//			options.isoclient.end();
 			//			setTimeout(function(){
-			//				self.connectNow.apply(self, arguments);
-			//			}, 2000, self.conx_params);
-			self.readPacketArray[i].sent = true;
-			self.readPacketArray[i].rcvd = false;
-			self.readPacketArray[i].timeoutError = true;
+			//				options.connectNow.apply(self, arguments);
+			//			}, 2000, options.connectionParams);
+			options.readPacketArray[i].sent = true;
+			options.readPacketArray[i].rcvd = false;
+			options.readPacketArray[i].timeoutError = true;
 			if (!flagReconnect) {
 				// Prevent duplicates
-				console.log('Not Sending Read Packet because we are not connected - ISO CS is ' + self.isoConnectionState, 0, self.conx_ID);
+				console.log('Not Sending Read Packet because we are not connected - ISO CS is ' + options.isoConnectionState, 0, options.connectionID);
 			}
 			// This is essentially an instantTimeout.
-			if (self.isoConnectionState === 0) {
+			if (options.isoConnectionState === 0) {
 				flagReconnect = true;
 			}
-			console.log('Requesting PacketTimeout Due to ISO CS NOT 4 - READ SN ' + self.readPacketArray[i].seqNum, 1, self.conx_ID);
-			self.readPacketArray[i].timeout = setTimeout(function() {
-				self.packetTimeout.apply(self, arguments);
-			}, 0, "read", self.readPacketArray[i].seqNum);
+			console.log('Requesting PacketTimeout Due to ISO CS NOT 4 - READ SN ' + options.readPacketArray[i].seqNum, 1, options.connectionID);
+			options.readPacketArray[i].timeout = setTimeout(function() {
+				options.packetTimeout.apply(self, arguments);
+			}, 0, "read", options.readPacketArray[i].seqNum);
 		}
-		console.log('Sending Read Packet', 1, self.conx_ID);
+		console.log('Sending Read Packet', 1, options.connectionID);
 	}
 
 	if (flagReconnect) {
-		//		console.log("Asking for callback next tick and my ID is " + self.conx_ID);
+		//		console.log("Asking for callback next tick and my ID is " + options.connectionID);
 		setTimeout(function() {
-			//			console.log("Next tick is here and my ID is " + self.conx_ID);
-			console.log("The scheduled reconnect from sendReadPacket is happening now", 1, self.conx_ID);
-			self.connectNow(self.conx_params);  // We used to do this NOW - not NextTick() as we need to mark isoConnectionState as 1 right now.  Otherwise we queue up LOTS of connects and crash.
+			//			console.log("Next tick is here and my ID is " + options.connectionID);
+			console.log("The scheduled reconnect from sendReadPacket is happening now", 1, options.connectionID);
+			options.connectNow(options.connectionParams);  // We used to do this NOW - not NextTick() as we need to mark isoConnectionState as 1 right now.  Otherwise we queue up LOTS of connects and crash.
 		}, 0);
 	}
 
@@ -943,71 +935,71 @@ NodeS7.prototype.sendWritePacket = function() {
 
 	dataBuffer = new Buffer(8192);
 
-	self.writeInQueue = false;
+	options.writeInQueue = false;
 
-	for (i = 0; i < self.writePacketArray.length; i++) {
-		if (self.writePacketArray[i].sent) { continue; }
-		if (self.parallelJobsNow >= self.maxParallel) { continue; }
+	for (i = 0; i < options.writePacketArray.length; i++) {
+		if (options.writePacketArray[i].sent) { continue; }
+		if (options.parallelJobsNow >= options.maxParallel) { continue; }
 		// From here down is SENDING the packet
-		self.writePacketArray[i].reqTime = process.hrtime();
-		self.writeReq.writeUInt8(self.writePacketArray[i].itemList.length, 18);
-		self.writeReq.writeUInt16BE(self.writePacketArray[i].seqNum, 11);
+		options.writePacketArray[i].reqTime = process.hrtime();
+		options.writeReq.writeUInt8(options.writePacketArray[i].itemList.length, 18);
+		options.writeReq.writeUInt16BE(options.writePacketArray[i].seqNum, 11);
 
 		dataBufferPointer = 0;
-		for (var j = 0; j < self.writePacketArray[i].itemList.length; j++) {
-			S7AddrToBuffer(self.writePacketArray[i].itemList[j], true).copy(self.writeReq, 19 + j * 12);
-			itemBuffer = getWriteBuffer(self.writePacketArray[i].itemList[j]);
+		for (var j = 0; j < options.writePacketArray[i].itemList.length; j++) {
+			S7AddrToBuffer(options.writePacketArray[i].itemList[j], true).copy(options.writeReq, 19 + j * 12);
+			itemBuffer = getWriteBuffer(options.writePacketArray[i].itemList[j]);
 			itemBuffer.copy(dataBuffer, dataBufferPointer);
 			dataBufferPointer += itemBuffer.length;
 		}
 
 		//		console.log('DataBufferPointer is ' + dataBufferPointer);
-		self.writeReq.writeUInt16BE(19 + self.writePacketArray[i].itemList.length * 12 + dataBufferPointer, 2); // buffer length
-		self.writeReq.writeUInt16BE(self.writePacketArray[i].itemList.length * 12 + 2, 13); // Parameter length - 14 for one read, 28 for 2.
-		self.writeReq.writeUInt16BE(dataBufferPointer, 15); // Data length - as appropriate.
+		options.writeReq.writeUInt16BE(19 + options.writePacketArray[i].itemList.length * 12 + dataBufferPointer, 2); // buffer length
+		options.writeReq.writeUInt16BE(options.writePacketArray[i].itemList.length * 12 + 2, 13); // Parameter length - 14 for one read, 28 for 2.
+		options.writeReq.writeUInt16BE(dataBufferPointer, 15); // Data length - as appropriate.
 
-		dataBuffer.copy(self.writeReq, 19 + self.writePacketArray[i].itemList.length * 12, 0, dataBufferPointer);
+		dataBuffer.copy(options.writeReq, 19 + options.writePacketArray[i].itemList.length * 12, 0, dataBufferPointer);
 
-		if (self.isoConnectionState === 4) {
-			//			console.log('writing' + (19+dataBufferPointer+self.writePacketArray[i].itemList.length*12));
-			self.writePacketArray[i].timeout = setTimeout(function() {
-				self.packetTimeout.apply(self, arguments);
-			}, self.globalTimeout, "write", self.writePacketArray[i].seqNum);
-			self.isoclient.write(self.writeReq.slice(0, 19 + dataBufferPointer + self.writePacketArray[i].itemList.length * 12));  // was 31
-			self.writePacketArray[i].sent = true;
-			self.writePacketArray[i].rcvd = false;
-			self.writePacketArray[i].timeoutError = false;
-			self.parallelJobsNow += 1;
-			console.log('Sending Write Packet With Sequence Number ' + self.writePacketArray[i].seqNum, 1, self.conx_ID);
+		if (options.isoConnectionState === 4) {
+			//			console.log('writing' + (19+dataBufferPointer+options.writePacketArray[i].itemList.length*12));
+			options.writePacketArray[i].timeout = setTimeout(function() {
+				options.packetTimeout.apply(self, arguments);
+			}, options.globalTimeout, "write", options.writePacketArray[i].seqNum);
+			options.isoclient.write(options.writeReq.slice(0, 19 + dataBufferPointer + options.writePacketArray[i].itemList.length * 12));  // was 31
+			options.writePacketArray[i].sent = true;
+			options.writePacketArray[i].rcvd = false;
+			options.writePacketArray[i].timeoutError = false;
+			options.parallelJobsNow += 1;
+			console.log('Sending Write Packet With Sequence Number ' + options.writePacketArray[i].seqNum, 1, options.connectionID);
 		} else {
 			//			console.log('Somehow got into write block without proper isoConnectionState of 4.  Disconnect.');
 			//			connectionReset();
 			//			setTimeout(connectNow, 2000, connectionParams);
 			// This is essentially an instantTimeout.
-			self.writePacketArray[i].sent = true;
-			self.writePacketArray[i].rcvd = false;
-			self.writePacketArray[i].timeoutError = true;
+			options.writePacketArray[i].sent = true;
+			options.writePacketArray[i].rcvd = false;
+			options.writePacketArray[i].timeoutError = true;
 
 			// Without the scopePlaceholder, this doesn't work.   writePacketArray[i] becomes undefined.
 			// The reason is that the value i is part of a closure and when seen "nextTick" has the same value
 			// it would have just after the FOR loop is done.
 			// (The FOR statement will increment it to beyond the array, then exit after the condition fails)
 			// scopePlaceholder works as the array is de-referenced NOW, not "nextTick".
-			var scopePlaceholder = self.writePacketArray[i].seqNum;
+			var scopePlaceholder = options.writePacketArray[i].seqNum;
 			process.nextTick(function() {
-				self.packetTimeout("write", scopePlaceholder);
+				options.packetTimeout("write", scopePlaceholder);
 			});
-			if (self.isoConnectionState === 0) {
+			if (options.isoConnectionState === 0) {
 				flagReconnect = true;
 			}
 		}
 	}
 	if (flagReconnect) {
-		//		console.log("Asking for callback next tick and my ID is " + self.conx_ID);
+		//		console.log("Asking for callback next tick and my ID is " + options.connectionID);
 		setTimeout(function() {
-			//			console.log("Next tick is here and my ID is " + self.conx_ID);
-			console.log("The scheduled reconnect from sendWritePacket is happening now", 1, self.conx_ID);
-			self.connectNow(self.conx_params);  // We used to do this NOW - not NextTick() as we need to mark isoConnectionState as 1 right now.  Otherwise we queue up LOTS of connects and crash.
+			//			console.log("Next tick is here and my ID is " + options.connectionID);
+			console.log("The scheduled reconnect from sendWritePacket is happening now", 1, options.connectionID);
+			options.connectNow(options.connectionParams);  // We used to do this NOW - not NextTick() as we need to mark isoConnectionState as 1 right now.  Otherwise we queue up LOTS of connects and crash.
 		}, 0);
 	}
 }
@@ -1015,7 +1007,7 @@ NodeS7.prototype.sendWritePacket = function() {
 NodeS7.prototype.isOptimizableArea = function(area) {
 	var self = this;
 
-	if (self.doNotOptimize) { return false; } // Are we skipping all optimization due to user request?
+	if (options.doNotOptimize) { return false; } // Are we skipping all optimization due to user request?
 	switch (area) {
 		case 0x84: // db
 		case 0x81: // input bytes
@@ -1039,13 +1031,13 @@ NodeS7.prototype.onResponse = function(data) {
 
 	// Decrement our parallel jobs now
 
-	// NOT SO FAST - can't do this here.  If we time out, then later get the reply, we can't decrement this twice.  Or the CPU will not like us.  Do it if not rcvd.  self.parallelJobsNow--;
+	// NOT SO FAST - can't do this here.  If we time out, then later get the reply, we can't decrement this twice.  Or the CPU will not like us.  Do it if not rcvd.  options.parallelJobsNow--;
 
 	if (data.length > 8 && data[8] != 3) {
 		console.log('PDU type (byte 8) was returned as ' + data[8] + ' where the response PDU of 3 was expected.');
 		console.log('Maybe you are requesting more than 240 bytes of data in a packet?');
 		console.log(data);
-		self.connectionReset();
+		options.connectionReset();
 		return null;
 	}
 
@@ -1055,7 +1047,7 @@ NodeS7.prototype.onResponse = function(data) {
 		console.log("We assume this is because two packets were sent at nearly the same time by the PLC.");
 		console.log("We are slicing the buffer and scheduling the second half for further processing next loop.");
 		setTimeout(function() {
-			self.onResponse.apply(self, arguments);
+			options.onResponse.apply(self, arguments);
 		}, 0, data.slice(data.readInt16BE(2)));  // This re-triggers this same function with the sliced-up buffer.
 		// was used as a test		setTimeout(process.exit, 2000);
 	}
@@ -1064,33 +1056,33 @@ NodeS7.prototype.onResponse = function(data) {
 		console.log('INVALID READ RESPONSE - DISCONNECTING');
 		console.log('TPKT Length From Header is ' + data.readInt16BE(2) + ' and RCV buffer length is ' + data.length + ' and COTP length is ' + data.readUInt8(4) + ' and data[6] is ' + data[6]);
 		console.log(data);
-		self.connectionReset();
+		options.connectionReset();
 		return null;
 	}
 
 	// Log the receive
-	console.log('Received ' + data.readUInt16BE(15) + ' bytes of S7-data from PLC.  Sequence number is ' + data.readUInt16BE(11), 1, self.conx_ID);
+	console.log('Received ' + data.readUInt16BE(15) + ' bytes of S7-data from PLC.  Sequence number is ' + data.readUInt16BE(11), 1, options.connectionID);
 
 	// Check the sequence number
-	var foundSeqNum; // self.readPacketArray.length - 1;
+	var foundSeqNum; // options.readPacketArray.length - 1;
 	var isReadResponse, isWriteResponse;
 
-	//	for (packetCount = 0; packetCount < self.readPacketArray.length; packetCount++) {
-	//		if (self.readPacketArray[packetCount].seqNum == data.readUInt16BE(11)) {
+	//	for (packetCount = 0; packetCount < options.readPacketArray.length; packetCount++) {
+	//		if (options.readPacketArray[packetCount].seqNum == data.readUInt16BE(11)) {
 	//			foundSeqNum = packetCount;
 	//			break;
 	//		}
 	//	}
-	foundSeqNum = self.findReadIndexOfSeqNum(data.readUInt16BE(11));
+	foundSeqNum = options.findReadIndexOfSeqNum(data.readUInt16BE(11));
 
-	//	if (self.readPacketArray[packetCount] == undefined) {
+	//	if (options.readPacketArray[packetCount] == undefined) {
 	if (foundSeqNum === undefined) {
-		foundSeqNum = self.findWriteIndexOfSeqNum(data.readUInt16BE(11));
+		foundSeqNum = options.findWriteIndexOfSeqNum(data.readUInt16BE(11));
 		if (foundSeqNum !== undefined) {
-			//		for (packetCount = 0; packetCount < self.writePacketArray.length; packetCount++) {
-			//			if (self.writePacketArray[packetCount].seqNum == data.readUInt16BE(11)) {
+			//		for (packetCount = 0; packetCount < options.writePacketArray.length; packetCount++) {
+			//			if (options.writePacketArray[packetCount].seqNum == data.readUInt16BE(11)) {
 			//				foundSeqNum = packetCount;
-			self.writeResponse(data, foundSeqNum);
+			options.writeResponse(data, foundSeqNum);
 			isWriteResponse = true;
 			//				break;
 		}
@@ -1098,23 +1090,23 @@ NodeS7.prototype.onResponse = function(data) {
 
 	} else {
 		isReadResponse = true;
-		self.readResponse(data, foundSeqNum);
+		options.readResponse(data, foundSeqNum);
 	}
 
 	if ((!isReadResponse) && (!isWriteResponse)) {
 		console.log("Sequence number that arrived wasn't a write reply either - dropping");
 		console.log(data);
 		// 	I guess this isn't a showstopper, just ignore it.
-		//		self.isoclient.end();
-		//		setTimeout(self.connectNow, 2000, self.conx_params);
+		//		options.isoclient.end();
+		//		setTimeout(options.connectNow, 2000, options.connectionParams);
 		return null;
 	}
 }
 
 NodeS7.prototype.findReadIndexOfSeqNum = function(seqNum) {
 	var self = this, packetCounter;
-	for (packetCounter = 0; packetCounter < self.readPacketArray.length; packetCounter++) {
-		if (self.readPacketArray[packetCounter].seqNum == seqNum) {
+	for (packetCounter = 0; packetCounter < options.readPacketArray.length; packetCounter++) {
+		if (options.readPacketArray[packetCounter].seqNum == seqNum) {
 			return packetCounter;
 		}
 	}
@@ -1123,8 +1115,8 @@ NodeS7.prototype.findReadIndexOfSeqNum = function(seqNum) {
 
 NodeS7.prototype.findWriteIndexOfSeqNum = function(seqNum) {
 	var self = this, packetCounter;
-	for (packetCounter = 0; packetCounter < self.writePacketArray.length; packetCounter++) {
-		if (self.writePacketArray[packetCounter].seqNum == seqNum) {
+	for (packetCounter = 0; packetCounter < options.writePacketArray.length; packetCounter++) {
+		if (options.writePacketArray[packetCounter].seqNum == seqNum) {
 			return packetCounter;
 		}
 	}
@@ -1134,9 +1126,9 @@ NodeS7.prototype.findWriteIndexOfSeqNum = function(seqNum) {
 NodeS7.prototype.writeResponse = function(data, foundSeqNum) {
 	var self = this, dataPointer = 21, i, anyBadQualities;
 
-	for (var itemCount = 0; itemCount < self.writePacketArray[foundSeqNum].itemList.length; itemCount++) {
+	for (var itemCount = 0; itemCount < options.writePacketArray[foundSeqNum].itemList.length; itemCount++) {
 		//		console.log('Pointer is ' + dataPointer);
-		dataPointer = processS7WriteItem(data, self.writePacketArray[foundSeqNum].itemList[itemCount], dataPointer);
+		dataPointer = processS7WriteItem(data, options.writePacketArray[foundSeqNum].itemList[itemCount], dataPointer);
 		if (!dataPointer) {
 			console.log('Stopping Processing Write Response Packet due to unrecoverable packet error');
 			break;
@@ -1144,34 +1136,34 @@ NodeS7.prototype.writeResponse = function(data, foundSeqNum) {
 	}
 
 	// Make a note of the time it took the PLC to process the request.
-	self.writePacketArray[foundSeqNum].reqTime = process.hrtime(self.writePacketArray[foundSeqNum].reqTime);
-	console.log('Time is ' + self.writePacketArray[foundSeqNum].reqTime[0] + ' seconds and ' + Math.round(self.writePacketArray[foundSeqNum].reqTime[1] * 10 / 1e6) / 10 + ' ms.', 1, self.conx_ID);
+	options.writePacketArray[foundSeqNum].reqTime = process.hrtime(options.writePacketArray[foundSeqNum].reqTime);
+	console.log('Time is ' + options.writePacketArray[foundSeqNum].reqTime[0] + ' seconds and ' + Math.round(options.writePacketArray[foundSeqNum].reqTime[1] * 10 / 1e6) / 10 + ' ms.', 1, options.connectionID);
 
-	//	self.writePacketArray.splice(foundSeqNum, 1);
-	if (!self.writePacketArray[foundSeqNum].rcvd) {
-		self.writePacketArray[foundSeqNum].rcvd = true;
-		self.parallelJobsNow--;
+	//	options.writePacketArray.splice(foundSeqNum, 1);
+	if (!options.writePacketArray[foundSeqNum].rcvd) {
+		options.writePacketArray[foundSeqNum].rcvd = true;
+		options.parallelJobsNow--;
 	}
-	clearTimeout(self.writePacketArray[foundSeqNum].timeout);
+	clearTimeout(options.writePacketArray[foundSeqNum].timeout);
 
-	if (!self.writePacketArray.every(doneSending)) {
-		self.sendWritePacket();
+	if (!options.writePacketArray.every(doneSending)) {
+		options.sendWritePacket();
 	} else {
-		for (i = 0; i < self.writePacketArray.length; i++) {
-			self.writePacketArray[i].sent = false;
-			self.writePacketArray[i].rcvd = false;
+		for (i = 0; i < options.writePacketArray.length; i++) {
+			options.writePacketArray[i].sent = false;
+			options.writePacketArray[i].rcvd = false;
 		}
 
 		anyBadQualities = false;
 
-		for (i = 0; i < self.globalWriteBlockList.length; i++) {
+		for (i = 0; i < options.globalWriteBlockList.length; i++) {
 			// Post-process the write code and apply the quality.
 			// Loop through the global block list...
-			writePostProcess(self.globalWriteBlockList[i]);
-			console.log(self.globalWriteBlockList[i].addr + ' write completed with quality ' + self.globalWriteBlockList[i].writeQuality, 1, self.conx_ID);
-			if (!isQualityOK(self.globalWriteBlockList[i].writeQuality)) { anyBadQualities = true; }
+			writePostProcess(options.globalWriteBlockList[i]);
+			console.log(options.globalWriteBlockList[i].addr + ' write completed with quality ' + options.globalWriteBlockList[i].writeQuality, 1, options.connectionID);
+			if (!isQualityOK(options.globalWriteBlockList[i].writeQuality)) { anyBadQualities = true; }
 		}
-		self.writeDoneCallback(anyBadQualities);
+		options.writeDoneCallback(anyBadQualities);
 	}
 }
 
@@ -1185,130 +1177,130 @@ NodeS7.prototype.readResponse = function(data, foundSeqNum) {
 	var dataPointer = 21; // For non-routed packets we start at byte 21 of the packet.  If we do routing it will be more than this.
 	var dataObject = {};
 
-	console.log("ReadResponse called", 1, self.conx_ID);
+	console.log("ReadResponse called", 1, options.connectionID);
 
-	if (!self.readPacketArray[foundSeqNum].sent) {
-		console.log('WARNING: Received a read response packet that was not marked as sent', 0, self.conx_ID);
+	if (!options.readPacketArray[foundSeqNum].sent) {
+		console.log('WARNING: Received a read response packet that was not marked as sent', 0, options.connectionID);
 		//TODO - fix the network unreachable error that made us do this
 		return null;
 	}
 
-	if (self.readPacketArray[foundSeqNum].rcvd) {
-		console.log('WARNING: Received a read response packet that was already marked as received', 0, self.conx_ID);
+	if (options.readPacketArray[foundSeqNum].rcvd) {
+		console.log('WARNING: Received a read response packet that was already marked as received', 0, options.connectionID);
 		return null;
 	}
 
-	for (var itemCount = 0; itemCount < self.readPacketArray[foundSeqNum].itemList.length; itemCount++) {
-		dataPointer = processS7Packet(data, self.readPacketArray[foundSeqNum].itemList[itemCount], dataPointer);
+	for (var itemCount = 0; itemCount < options.readPacketArray[foundSeqNum].itemList.length; itemCount++) {
+		dataPointer = processS7Packet(data, options.readPacketArray[foundSeqNum].itemList[itemCount], dataPointer);
 		if (!dataPointer) {
-			console.log('Received a ZERO RESPONSE Processing Read Packet due to unrecoverable packet error', 0, self.conx_ID);
+			console.log('Received a ZERO RESPONSE Processing Read Packet due to unrecoverable packet error', 0, options.connectionID);
 			// We rely on this for our timeout.
 		}
 	}
 
 	// Make a note of the time it took the PLC to process the request.
-	self.readPacketArray[foundSeqNum].reqTime = process.hrtime(self.readPacketArray[foundSeqNum].reqTime);
-	console.log('Time is ' + self.readPacketArray[foundSeqNum].reqTime[0] + ' seconds and ' + Math.round(self.readPacketArray[foundSeqNum].reqTime[1] * 10 / 1e6) / 10 + ' ms.', 1, self.conx_ID);
+	options.readPacketArray[foundSeqNum].reqTime = process.hrtime(options.readPacketArray[foundSeqNum].reqTime);
+	console.log('Time is ' + options.readPacketArray[foundSeqNum].reqTime[0] + ' seconds and ' + Math.round(options.readPacketArray[foundSeqNum].reqTime[1] * 10 / 1e6) / 10 + ' ms.', 1, options.connectionID);
 
 	// Do the bookkeeping for packet and timeout.
-	if (!self.readPacketArray[foundSeqNum].rcvd) {
-		self.readPacketArray[foundSeqNum].rcvd = true;
-		self.parallelJobsNow--;
+	if (!options.readPacketArray[foundSeqNum].rcvd) {
+		options.readPacketArray[foundSeqNum].rcvd = true;
+		options.parallelJobsNow--;
 	}
-	clearTimeout(self.readPacketArray[foundSeqNum].timeout);
+	clearTimeout(options.readPacketArray[foundSeqNum].timeout);
 
-	if (self.readPacketArray.every(doneSending)) {  // if sendReadPacket returns true we're all done.
+	if (options.readPacketArray.every(doneSending)) {  // if sendReadPacket returns true we're all done.
 		// Mark our packets unread for next time.
-		for (i = 0; i < self.readPacketArray.length; i++) {
-			self.readPacketArray[i].sent = false;
-			self.readPacketArray[i].rcvd = false;
+		for (i = 0; i < options.readPacketArray.length; i++) {
+			options.readPacketArray[i].sent = false;
+			options.readPacketArray[i].rcvd = false;
 		}
 
 		anyBadQualities = false;
 
 		// Loop through the global block list...
-		for (i = 0; i < self.globalReadBlockList.length; i++) {
+		for (i = 0; i < options.globalReadBlockList.length; i++) {
 			var lengthOffset = 0;
 			// For each block, we loop through all the requests.  Remember, for all but large arrays, there will only be one.
-			for (var j = 0; j < self.globalReadBlockList[i].requestReference.length; j++) {
+			for (var j = 0; j < options.globalReadBlockList[i].requestReference.length; j++) {
 				// Now that our request is complete, we reassemble the BLOCK byte buffer as a copy of each and every request byte buffer.
-				self.globalReadBlockList[i].requestReference[j].byteBuffer.copy(self.globalReadBlockList[i].byteBuffer, lengthOffset, 0, self.globalReadBlockList[i].requestReference[j].byteLength);
-				self.globalReadBlockList[i].requestReference[j].qualityBuffer.copy(self.globalReadBlockList[i].qualityBuffer, lengthOffset, 0, self.globalReadBlockList[i].requestReference[j].byteLength);
-				lengthOffset += self.globalReadBlockList[i].requestReference[j].byteLength;
+				options.globalReadBlockList[i].requestReference[j].byteBuffer.copy(options.globalReadBlockList[i].byteBuffer, lengthOffset, 0, options.globalReadBlockList[i].requestReference[j].byteLength);
+				options.globalReadBlockList[i].requestReference[j].qualityBuffer.copy(options.globalReadBlockList[i].qualityBuffer, lengthOffset, 0, options.globalReadBlockList[i].requestReference[j].byteLength);
+				lengthOffset += options.globalReadBlockList[i].requestReference[j].byteLength;
 			}
 			// For each ITEM reference pointed to by the block, we process the item.
-			for (var k = 0; k < self.globalReadBlockList[i].itemReference.length; k++) {
-				processS7ReadItem(self.globalReadBlockList[i].itemReference[k]);
-				console.log('Address ' + self.globalReadBlockList[i].itemReference[k].addr + ' has value ' + self.globalReadBlockList[i].itemReference[k].value + ' and quality ' + self.globalReadBlockList[i].itemReference[k].quality, 1, self.conx_ID);
-				if (!isQualityOK(self.globalReadBlockList[i].itemReference[k].quality)) {
+			for (var k = 0; k < options.globalReadBlockList[i].itemReference.length; k++) {
+				processS7ReadItem(options.globalReadBlockList[i].itemReference[k]);
+				console.log('Address ' + options.globalReadBlockList[i].itemReference[k].addr + ' has value ' + options.globalReadBlockList[i].itemReference[k].value + ' and quality ' + options.globalReadBlockList[i].itemReference[k].quality, 1, options.connectionID);
+				if (!isQualityOK(options.globalReadBlockList[i].itemReference[k].quality)) {
 					anyBadQualities = true;
-					dataObject[self.globalReadBlockList[i].itemReference[k].useraddr] = self.globalReadBlockList[i].itemReference[k].quality;
+					dataObject[options.globalReadBlockList[i].itemReference[k].useraddr] = options.globalReadBlockList[i].itemReference[k].quality;
 				} else {
-					dataObject[self.globalReadBlockList[i].itemReference[k].useraddr] = self.globalReadBlockList[i].itemReference[k].value;
+					dataObject[options.globalReadBlockList[i].itemReference[k].useraddr] = options.globalReadBlockList[i].itemReference[k].value;
 				}
 			}
 		}
 
 		// Inform our user that we are done and that the values are ready for pickup.
 
-		console.log("We are calling back our readDoneCallback.", 1, self.conx_ID);
-		if (typeof (self.readDoneCallback === 'function')) {
-			self.readDoneCallback(anyBadQualities, dataObject);
+		console.log("We are calling back our readDoneCallback.", 1, options.connectionID);
+		if (typeof (options.readDoneCallback === 'function')) {
+			options.readDoneCallback(anyBadQualities, dataObject);
 		}
-		if (self.resetPending) {
-			self.resetNow();
+		if (options.resetPending) {
+			options.resetNow();
 		}
 
-		if (!self.isReading() && self.writeInQueue) { self.sendWritePacket(); }
+		if (!options.isReading() && options.writeInQueue) { options.sendWritePacket(); }
 	} else {
-		self.sendReadPacket();
+		options.sendReadPacket();
 	}
 }
 
 
 NodeS7.prototype.onClientDisconnect = function() {
 	var self = this;
-	console.log('ISO-on-TCP connection DISCONNECTED.', 0, self.conx_ID);
+	console.log('ISO-on-TCP connection DISCONNECTED.', 0, options.connectionID);
 
 	// We issue the callback here for Trela/Honcho - in some cases TCP connects, and ISO-on-TCP doesn't.
 	// If this is the case we need to issue the Connect CB in order to keep trying.
-	if ((!self.connectCBIssued) && (typeof (self.connectCallback) === "function")) {
-		self.connectCBIssued = true;
-		self.connectCallback("Error - TCP connected, ISO didn't");
+	if ((!options.connectCBIssued) && (typeof (options.connectCallback) === "function")) {
+		options.connectCBIssued = true;
+		options.connectCallback("Error - TCP connected, ISO didn't");
 	}
 
 	// This event is called when the OTHER END of the connection sends a FIN packet.
 	// Certain situations (download user program to mem card on S7-400, pop memory card out of S7-300, both with NetLink) cause this to happen.
 	// So now, let's try a "connetionReset".  This way, we are guaranteed to return values (or bad) and reset at the proper time.
-	self.connectionReset();
+	options.connectionReset();
 }
 
 NodeS7.prototype.onClientClose = function() {
 	var self = this;
 
     // clean up the connection now the socket has closed
-	self.connectionCleanup();
+	options.connectionCleanup();
 
     // initiate the callback stored by dropConnection
-    if (self.dropConnectionCallback) {
-        self.dropConnectionCallback();
+    if (options.dropConnectionCallback) {
+        options.dropConnectionCallback();
 
         // prevent any possiblity of the callback being called twice
-        self.dropConnectionCallback = null;
+        options.dropConnectionCallback = null;
 
         // and cancel the timeout
-        clearTimeout(self.dropConnectionTimer);
+        clearTimeout(options.dropConnectionTimer);
     }
 }
 
 NodeS7.prototype.connectionReset = function() {
 	var self = this;
-	self.isoConnectionState = 0;
-	self.resetPending = true;
+	options.isoConnectionState = 0;
+	options.resetPending = true;
 	console.log('ConnectionReset is happening');
-	if (!self.isReading() && typeof (self.resetTimeout) === 'undefined') { // For now - ignore writes.  && !isWriting()) {
-		self.resetTimeout = setTimeout(function() {
-			self.resetNow.apply(self, arguments);
+	if (!options.isReading() && typeof (options.resetTimeout) === 'undefined') { // For now - ignore writes.  && !isWriting()) {
+		options.resetTimeout = setTimeout(function() {
+			options.resetNow.apply(self, arguments);
 		}, 1500);
 	}
 	// We wait until read() is called again to re-connect.
@@ -1316,34 +1308,34 @@ NodeS7.prototype.connectionReset = function() {
 
 NodeS7.prototype.resetNow = function() {
 	var self = this;
-	self.isoConnectionState = 0;
-	self.isoclient.end();
+	options.isoConnectionState = 0;
+	options.isoclient.end();
 	console.log('ResetNOW is happening');
-	self.resetPending = false;
+	options.resetPending = false;
 	// In some cases, we can have a timeout scheduled for a reset, but we don't want to call it again in that case.
 	// We only want to call a reset just as we are returning values.  Otherwise, we will get asked to read // more values and we will "break our promise" to always return something when asked.
-	if (typeof (self.resetTimeout) !== 'undefined') {
-		clearTimeout(self.resetTimeout);
-		self.resetTimeout = undefined;
+	if (typeof (options.resetTimeout) !== 'undefined') {
+		clearTimeout(options.resetTimeout);
+		options.resetTimeout = undefined;
 		console.log('Clearing an earlier scheduled reset');
 	}
 }
 
 NodeS7.prototype.connectionCleanup = function() {
 	var self = this;
-	self.isoConnectionState = 0;
+	options.isoConnectionState = 0;
 	console.log('Connection cleanup is happening');
-	if (typeof (self.isoclient) !== "undefined") {
-		self.isoclient.removeAllListeners('data');
-		self.isoclient.removeAllListeners('error');
-		self.isoclient.removeAllListeners('connect');
-		self.isoclient.removeAllListeners('end');
-        self.isoclient.removeAllListeners('close');
+	if (typeof (options.isoclient) !== "undefined") {
+		options.isoclient.removeAllListeners('data');
+		options.isoclient.removeAllListeners('error');
+		options.isoclient.removeAllListeners('connect');
+		options.isoclient.removeAllListeners('end');
+        options.isoclient.removeAllListeners('close');
 	}
-	clearTimeout(self.connectTimeout);
-	clearTimeout(self.PDUTimeout);
-	self.clearReadPacketTimeouts();  // Note this clears timeouts.
-	self.clearWritePacketTimeouts();  // Note this clears timeouts.
+	clearTimeout(options.connectTimeout);
+	clearTimeout(options.PDUTimeout);
+	options.clearReadPacketTimeouts();  // Note this clears timeouts.
+	options.clearWritePacketTimeouts();  // Note this clears timeouts.
 }
 
 /**
