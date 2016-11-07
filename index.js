@@ -11,4 +11,11 @@ PLC.on('initialized', ()=>{
 	console.log('initialization successful')
 })
 
-S7.initialize()
+PLC.emit('initialize')
+
+
+PLC.on('connected', ()=>{
+	console.log('connection established')
+})
+
+PLC.emit('connect')

@@ -63,8 +63,6 @@ var options = {
 module.exports = (opts)=>{
 	for (var X in opts) options[X] = opts[X]
 
-	eventor.emit('load', 'S7 module successfully loaded')
-
 	return {
 		 emitter: eventor
 		,options: (opts)=>{
@@ -75,6 +73,8 @@ module.exports = (opts)=>{
 		}
 	}
 }
+
+eventor.emit('load', 'S7 module successfully loaded')
 
 eventor
 .on('connect', (cParam)=>{
@@ -107,9 +107,9 @@ eventor
 
 	eventor.emit('initialized')
 
-	connectNow(options.connectionParams, false);
+	eventor.emit('connect', options.connectionParams, false);
 })
-.on('drop', (callback) {
+.on('drop', (callback)=>{
 	if (typeof (options.isoclient) !== 'undefined') {
 		// store the callback and request and end to the connection
 		options.dropped = callback;
@@ -136,29 +136,23 @@ eventor
 		callback();
 	}
 })
-
-function connectError(e) {
-	var self = this;
-
+.on('error_connect', (error)=>{
 	// Note that a TCP connection timeout error will appear here.  An ISO connection timeout error is a packet timeout.
 	console.log('We Caught a connect error ' + e.code, 0, options.connectionID);
+
 	if ((!options.connectCBIssued) && (typeof (options.connected) === "function")) {
 		options.connectCBIssued = true;
 		options.connected(e);
 	}
-	options.isoConnectionState = 0;
-}
 
-readWriteError = function(e) {
-	var self = this;
+	options.isoConnectionState = 0;
+})
+.on('error_readWrite', (error)=>{
 	console.log('We Caught a read/write error ' + e.code + ' - will DISCONNECT and attempt to reconnect.');
 	options.isoConnectionState = 0;
 	options.connectionReset();
-}
-
-packetTimeout = function(packetType, packetSeqNum) {
-	var self = this;
-
+})
+.on('timeout_packet', (packetType, packetSeqNum)=>{
 	console.log('PacketTimeout called with type ' + packetType + ' and seq ' + packetSeqNum, 1, options.connectionID);
 
 	if (packetType === "connect") {
@@ -168,7 +162,7 @@ packetTimeout = function(packetType, packetSeqNum) {
 		console.log("Scheduling a reconnect from packetTimeout, connect type", 0, options.connectionID);
 		setTimeout(function() {
 			console.log("The scheduled reconnect from packetTimeout, connect type, is happening now", 0, options.connectionID);
-			connectNow.apply(self, arguments);
+			eventor.emit('connect')
 		}, 2000, options.connectionParams);
 		return undefined;
 	}
@@ -180,7 +174,7 @@ packetTimeout = function(packetType, packetSeqNum) {
 		console.log("Scheduling a reconnect from packetTimeout, connect type", 0, options.connectionID);
 		setTimeout(function() {
 			console.log("The scheduled reconnect from packetTimeout, PDU type, is happening now", 0, options.connectionID);
-			connectNow.apply(self, arguments);
+			eventor.emit('connect')
 		}, 2000, options.connectionParams);
 		return undefined;
 	}
@@ -193,16 +187,13 @@ packetTimeout = function(packetType, packetSeqNum) {
 	
 	if (packetType === "write") {
 		console.log("WRITE TIMEOUT on sequence number " + packetSeqNum, 0, options.connectionID);
-		options.writeResponse(undefined, options.findWriteIndexOfSeqNum(packetSeqNum));
+		eventor.emit('writeResponse', undefined, options.findWriteIndexOfSeqNum(packetSeqNum));
 		return undefined;
 	}
 	
 	console.log("Unknown timeout error.  Nothing was done - this shouldn't happen.");
-}
-
-function onTCPConnect() {
-	var self = this;
-
+})
+.on('tcp_connect', ()=>{
 	console.log('TCP Connection Established to ' + options.isoclient.remoteAddress + ' on port ' + options.isoclient.remotePort, 0, options.connectionID);
 	console.log('Will attempt ISO-on-TCP connection', 0, options.connectionID);
 
@@ -211,7 +202,7 @@ function onTCPConnect() {
 
 	// Send an ISO-on-TCP connection request.
 	options.connectTimeout = setTimeout(function() {
-		options.packetTimeout.apply(self, arguments);
+		eventor.emit('timeout_packet')
 	}, options.globalTimeout, "connect");
 
 	options.connectReq[21] = options.rack * 32 + options.slot;
@@ -220,8 +211,8 @@ function onTCPConnect() {
 
 	// Listen for a reply.
 	options.isoclient.on('data', function() {
-		options.onISOConnectReply.apply(self, arguments);
-	});
+		eventor.emit('onISOConnectReply')
+	})
 
 	// Hook up the event that fires on disconnect
 	options.isoclient.on('end', function() {
@@ -233,12 +224,9 @@ function onTCPConnect() {
 		options.onClientClose.apply(self, arguments);
 
 	});
-}
-
-onISOConnectReply = function(data) {
-	var self = this;
-
-	options.isoclient.removeAllListeners('data'); //options.onISOConnectReply);
+})
+.on('ISO_connect_reply', (data)=>{
+	options.isoclient.removeAllListeners('data');
 	options.isoclient.removeAllListeners('error');
 
 	clearTimeout(options.connectTimeout);
@@ -268,16 +256,14 @@ onISOConnectReply = function(data) {
 	options.isoclient.write(options.negotiatePDU.slice(0, 25));
 
 	options.isoclient.on('data', function() {
-		options.onPDUReply.apply(self, arguments);
+		eventor.emit('PDU_reply');
 	});
 
 	options.isoclient.on('error', function() {
-		options.readWriteError.apply(self, arguments);
+		eventor.emit('error_readWrite');
 	});
-}
-
-onPDUReply = function(data) {
-	var self = this;
+})
+.on('PDU_reply', (data)=>{
 	options.isoclient.removeAllListeners('data');
 	options.isoclient.removeAllListeners('error');
 
@@ -290,12 +276,11 @@ onPDUReply = function(data) {
 		console.log(data);
 		options.isoclient.end();
 		setTimeout(function() {
-			connectNow.apply(self, arguments);
+			eventor.emit('connect')
 		}, 2000, options.connectionParams);
 		return null;
 	}
 
-	// Track the connection state
 	options.isoConnectionState = 4;  // 4 = Received PDU response, good to go
 
 	var partnerMaxParallel1 = data.readInt16BE(21);
@@ -321,25 +306,19 @@ onPDUReply = function(data) {
 	console.log('Received PDU Response - Proceeding with PDU ' + options.maxPDU + ' and ' + options.maxParallel + ' max parallel connections.', 0, options.connectionID);
 
 	options.isoclient.on('data', function() {
-		options.onResponse.apply(self, arguments);
-	});  // We need to make sure we don't add this event every time if we call it on data.
+		eventor.emit('onResponse')
+	})
 
 	options.isoclient.on('error', function() {
-		options.readWriteError.apply(self, arguments);
-	});  // Might want to remove the options.error listener
-
-	//options.isoclient.removeAllListeners('error');
+		eventor.emit('error_readWrite');
+	})
 
 	if ((!options.connectCBIssued) && (typeof (options.connected) === "function")) {
 		options.connectCBIssued = true;
 		options.connected();
 	}
-
-}
-
-
-writeItems = function(arg, value, cb) {
-	var self = this, i;
+})
+.on('write', (arg, value, cb)=>{
 	console.log("Preparing to WRITE " + arg + " to value " + value, 0, options.connectionID);
 	if (options.isWriting()) {
 		console.log("You must wait until all previous writes have finished before scheduling another. ", 0, options.connectionID);
@@ -370,40 +349,40 @@ writeItems = function(arg, value, cb) {
 		}
 	}
 
-	// Validity check.
 	for (i = options.instantWriteBlockList.length - 1; i >= 0; i--) {
 		if (options.instantWriteBlockList[i] === undefined) {
 			options.instantWriteBlockList.splice(i, 1);
 			console.log("Dropping an undefined write item.");
 		}
 	}
-	options.prepareWritePacket();
+	eventor.emit('prepareWritePacket')
 	if (!options.isReading()) {
-		options.sendWritePacket();
+		eventor.emit('sendWritePacket')
 	} else {
 		options.writeInQueue = true;
-	}
-}
-
-
-findItem = function(useraddr) {
-	var self = this, i;
+	}	
+})
+.on('find', (useraddr)=>{
+	var i;
 	var commstate = { value: options.isoConnectionState !== 4, quality: 'OK' };
+	
 	if (useraddr === '_COMMERR') { return commstate; }
+	
 	for (i = 0; i < options.polledReadBlockList.length; i++) {
 		if (options.polledReadBlockList[i].useraddr === useraddr) { return options.polledReadBlockList[i]; }
 	}
-	return undefined;
-}
 
-addItems = function(arg) {
-	var self = this;
+	return undefined
+})
+.on('add', (arg)=>{
+	// add an item to the array of tags
 	options.addRemoveArray.push({ arg: arg, action: 'add' });
-}
+})
+.on('addNow', (arg)=>{
+	var i
 
-addItemsNow = function(arg) {
-	var self = this, i;
 	console.log("Adding " + arg, 0, options.connectionID);
+	
 	if (typeof (arg) === "string" && arg !== "_COMMERR") {
 		options.polledReadBlockList.push(stringToS7Addr(options.translation(arg), arg));
 	} else if (Array.isArray(arg)) {
@@ -414,24 +393,23 @@ addItemsNow = function(arg) {
 		}
 	}
 
-	// Validity check.
 	for (i = options.polledReadBlockList.length - 1; i >= 0; i--) {
+		// Validity check.
 		if (options.polledReadBlockList[i] === undefined) {
 			options.polledReadBlockList.splice(i, 1);
 			console.log("Dropping an undefined request item.", 0, options.connectionID);
 		}
 	}
-	//	options.prepareReadPacket();
+
 	options.readPacketValid = false;
-}
-
-removeItems = function(arg) {
-	var self = this;
+})
+.on('remove', (arg)=>{
+	// remove a tag from the RW list
 	options.addRemoveArray.push({ arg: arg, action: 'remove' });
-}
+})
+.on('removeNow', (arg)=>{
+	var i;
 
-removeItemsNow = function(arg) {
-	var self = this, i;
 	if (typeof arg === "undefined") {
 		options.polledReadBlockList = [];
 	} else if (typeof arg === "string") {
@@ -451,14 +429,13 @@ removeItemsNow = function(arg) {
 			}
 		}
 	}
+	
 	options.readPacketValid = false;
-	//	options.prepareReadPacket();
-}
+})
+.on('read', (arg)=>{
+	// read all items on the RW list
 
-readAllItems = function(arg) {
-	var self = this;
-
-	console.log("Reading All Items (readAllItems was called)", 1, options.connectionID);
+	console.log("Reading All Items ", 1, options.connectionID);
 
 	if (typeof arg === "function") {
 		options.readSuccess = arg;
@@ -473,59 +450,36 @@ readAllItems = function(arg) {
 	// Check if ALL are done...  You might think we could look at parallel jobs, and for the most part we can, but if one just finished and we end up here before starting another, it's bad.
 	if (options.isWaiting()) {
 		console.log("Waiting to read for all R/W operations to complete.  Will re-trigger readAllItems in 100ms.", 0, options.connectionID);
+
 		setTimeout(function() {
-			options.readAllItems.apply(self, arguments);
+			eventor.emit('read')
 		}, 100, arg);
-		return;
+
+		return
 	}
 
 	// Now we check the array of adding and removing things.  Only now is it really safe to do this.
 	options.addRemoveArray.forEach(function(element) {
 		console.log('Adding or Removing ' + util.format(element), 1, options.connectionID);
 		if (element.action === 'remove') {
-			options.removeItemsNow(element.arg);
+			eventor.emit('removeNow', element.arg);
 		}
+
 		if (element.action === 'add') {
-			options.addItemsNow(element.arg);
+			eventor.emit('addNow', element.arg);
 		}
 	});
 
 	options.addRemoveArray = []; // Clear for next time.
 
-	if (!options.readPacketValid) { options.prepareReadPacket(); }
-
-	// ideally...  incrementSequenceNumbers();
+	if (!options.readPacketValid) { eventor.emit('prepareReadPacket') }
 
 	console.log("Calling SRP from RAI", 1, options.connectionID);
-	options.sendReadPacket(); // Note this sends the first few read packets depending on parallel connection restrictions.
-}
+	eventor.emit('sendReadPacket')	// Note this sends the first few read packets depending on parallel connection restrictions.
+})
+.on('clearReadPacketTimeouts', ()=>{
+	var i;
 
-isWaiting = function() {
-	var self = this;
-	return (options.isReading() || options.isWriting());
-}
-
-isReading = function() {
-	var self = this, i;
-	// Walk through the array and if any packets are marked as sent, it means we haven't received our final confirmation.
-	for (i = 0; i < options.readPacketArray.length; i++) {
-		if (options.readPacketArray[i].sent === true) { return true }
-	}
-	return false;
-}
-
-isWriting = function() {
-	var self = this, i;
-	// Walk through the array and if any packets are marked as sent, it means we haven't received our final confirmation.
-	for (i = 0; i < options.writePacketArray.length; i++) {
-		if (options.writePacketArray[i].sent === true) { return true }
-	}
-	return false;
-}
-
-
-function clearReadPacketTimeouts() {
-	var self = this, i;
 	console.log('Clearing read PacketTimeouts', 1, options.connectionID);
 	// Before we initialize the options.readPacketArray, we need to loop through all of them and clear timeouts.
 	for (i = 0; i < options.readPacketArray.length; i++) {
@@ -533,21 +487,21 @@ function clearReadPacketTimeouts() {
 		options.readPacketArray[i].sent = false;
 		options.readPacketArray[i].rcvd = false;
 	}
-}
+})
+.on('clearWritePacketTimeouts', ()=>{
+	var i;
 
-function clearWritePacketTimeouts() {
-	var self = this, i;
 	console.log('Clearing write PacketTimeouts', 1, options.connectionID);
+	
 	// Before we initialize the options.readPacketArray, we need to loop through all of them and clear timeouts.
 	for (i = 0; i < options.writePacketArray.length; i++) {
 		clearTimeout(options.writePacketArray[i].timeout);
 		options.writePacketArray[i].sent = false;
 		options.writePacketArray[i].rcvd = false;
 	}
-}
-
-prepareWritePacket = function() {
-	var self = this, i;
+})
+.on('prepareWritePacket', ()=>{
+	var i;
 	var itemList = options.instantWriteBlockList;
 	var requestList = [];			// The request list consists of the block list, split into chunks readable by PDU.
 	var requestNumber = 0;
@@ -630,7 +584,7 @@ prepareWritePacket = function() {
 		}
 	}
 
-	clearWritePacketTimeouts();
+	eventor.emit('clearWritePacketTimeouts')
 	options.writePacketArray = [];
 
 	//	console.log("GWBL is " + options.globalWriteBlockList.length);
@@ -683,10 +637,8 @@ prepareWritePacket = function() {
 		}
 		//		dataBuffer.copy(options.writeReq, 19 + (numItems + 1) * 12, 0, dataBufferPointer - 1);
 	}
-}
-
-
-prepareReadPacket = function() {
+})
+.on('prepareReadPacket', ()=>{
 	var self = this, i;
 	// Note that for a PDU size of 240, the MOST bytes we can request depends on the number of items.
 	// To figure this out, allow for a 247 byte packet.  7 TPKT+COTP header doesn't count for PDU, so 240 bytes of "S7 data".
@@ -812,7 +764,8 @@ prepareReadPacket = function() {
 	// The packetizer...
 	var requestNumber = 0;
 
-	clearReadPacketTimeouts();
+	eventor.emit('clearReadPacketTimeouts')
+
 	options.readPacketArray = [];
 
 	while (requestNumber < requestList.length) {
@@ -853,9 +806,8 @@ prepareReadPacket = function() {
 		}
 	}
 	options.readPacketValid = true;
-}
-
-sendReadPacket = function() {
+})
+.on('sendReadPacket', ()=>{
 	var self = this, i, j, flagReconnect = false;
 
 	console.log("SendReadPacket called", 1, options.connectionID);
@@ -887,7 +839,7 @@ sendReadPacket = function() {
 			//			console.log('Somehow got into read block without proper options.isoConnectionState of 3.  Disconnect.');
 			//			options.isoclient.end();
 			//			setTimeout(function(){
-			//				connectNow.apply(self, arguments);
+			//				eventor.emit('connect')
 			//			}, 2000, options.connectionParams);
 			options.readPacketArray[i].sent = true;
 			options.readPacketArray[i].rcvd = false;
@@ -913,16 +865,12 @@ sendReadPacket = function() {
 		setTimeout(function() {
 			//			console.log("Next tick is here and my ID is " + options.connectionID);
 			console.log("The scheduled reconnect from sendReadPacket is happening now", 1, options.connectionID);
-			connectNow(options.connectionParams);  // We used to do this NOW - not NextTick() as we need to mark isoConnectionState as 1 right now.  Otherwise we queue up LOTS of connects and crash.
+			eventor.emit('connect', options.connectionParams);  // We used to do this NOW - not NextTick() as we need to mark isoConnectionState as 1 right now.  Otherwise we queue up LOTS of connects and crash.
 		}, 0);
 	}
-
-
-}
-
-
-sendWritePacket = function() {
-	var self = this, i, dataBuffer, itemBuffer, dataBufferPointer, flagReconnect;
+})
+.on('sendWritePacket', ()=>{
+	var i, dataBuffer, itemBuffer, dataBufferPointer, flagReconnect;
 
 	dataBuffer = new Buffer(8192);
 
@@ -965,7 +913,7 @@ sendWritePacket = function() {
 		} else {
 			//			console.log('Somehow got into write block without proper isoConnectionState of 4.  Disconnect.');
 			//			connectionReset();
-			//			setTimeout(connectNow, 2000, connectionParams);
+			//			setTimeout(eventor.emit('connect'), 2000, connectionParams);
 			// This is essentially an instantTimeout.
 			options.writePacketArray[i].sent = true;
 			options.writePacketArray[i].rcvd = false;
@@ -978,7 +926,7 @@ sendWritePacket = function() {
 			// scopePlaceholder works as the array is de-referenced NOW, not "nextTick".
 			var scopePlaceholder = options.writePacketArray[i].seqNum;
 			process.nextTick(function() {
-				options.packetTimeout("write", scopePlaceholder);
+				eventor.emit('timeout_packet', "write", scopePlaceholder);
 			});
 			if (options.isoConnectionState === 0) {
 				flagReconnect = true;
@@ -990,27 +938,11 @@ sendWritePacket = function() {
 		setTimeout(function() {
 			//			console.log("Next tick is here and my ID is " + options.connectionID);
 			console.log("The scheduled reconnect from sendWritePacket is happening now", 1, options.connectionID);
-			connectNow(options.connectionParams);  // We used to do this NOW - not NextTick() as we need to mark isoConnectionState as 1 right now.  Otherwise we queue up LOTS of connects and crash.
+			eventor.emit('connect', options.connectionParams);  // We used to do this NOW - not NextTick() as we need to mark isoConnectionState as 1 right now.  Otherwise we queue up LOTS of connects and crash.
 		}, 0);
 	}
-}
-
-isOptimizableArea = function(area) {
-	var self = this;
-
-	if (options.doNotOptimize) { return false; } // Are we skipping all optimization due to user request?
-	switch (area) {
-		case 0x84: // db
-		case 0x81: // input bytes
-		case 0x82: // output bytes
-		case 0x83: // memory bytes
-			return true;
-		default:
-			return false;
-	}
-}
-
-onResponse = function(data) {
+})
+.on('onResponse', (data)=>{
 	var self = this;
 	// Packet Validity Check.  Note that this will pass even with a "not available" response received from the server.
 	// For length calculation and verification:
@@ -1038,7 +970,7 @@ onResponse = function(data) {
 		console.log("We assume this is because two packets were sent at nearly the same time by the PLC.");
 		console.log("We are slicing the buffer and scheduling the second half for further processing next loop.");
 		setTimeout(function() {
-			options.onResponse.apply(self, arguments);
+			eventor.emit('onResponse')
 		}, 0, data.slice(data.readInt16BE(2)));  // This re-triggers this same function with the sliced-up buffer.
 		// was used as a test		setTimeout(process.exit, 2000);
 	}
@@ -1073,7 +1005,7 @@ onResponse = function(data) {
 			//		for (packetCount = 0; packetCount < options.writePacketArray.length; packetCount++) {
 			//			if (options.writePacketArray[packetCount].seqNum == data.readUInt16BE(11)) {
 			//				foundSeqNum = packetCount;
-			options.writeResponse(data, foundSeqNum);
+			eventor.emit('writeResponse', data, foundSeqNum);
 			isWriteResponse = true;
 			//				break;
 		}
@@ -1089,36 +1021,14 @@ onResponse = function(data) {
 		console.log(data);
 		// 	I guess this isn't a showstopper, just ignore it.
 		//		options.isoclient.end();
-		//		setTimeout(connectNow, 2000, options.connectionParams);
+		//		setTimeout(eventor.emit('connect', options.connectionParams);
 		return null;
 	}
-}
-
-findReadIndexOfSeqNum = function(seqNum) {
-	var self = this, packetCounter;
-	for (packetCounter = 0; packetCounter < options.readPacketArray.length; packetCounter++) {
-		if (options.readPacketArray[packetCounter].seqNum == seqNum) {
-			return packetCounter;
-		}
-	}
-	return undefined;
-}
-
-findWriteIndexOfSeqNum = function(seqNum) {
-	var self = this, packetCounter;
-	for (packetCounter = 0; packetCounter < options.writePacketArray.length; packetCounter++) {
-		if (options.writePacketArray[packetCounter].seqNum == seqNum) {
-			return packetCounter;
-		}
-	}
-	return undefined;
-}
-
-writeResponse = function(data, foundSeqNum) {
-	var self = this, dataPointer = 21, i, anyBadQualities;
+})
+.on('writeResponse', (data, foundSeqNum)=>{
+	var dataPointer = 21, i, anyBadQualities;
 
 	for (var itemCount = 0; itemCount < options.writePacketArray[foundSeqNum].itemList.length; itemCount++) {
-		//		console.log('Pointer is ' + dataPointer);
 		dataPointer = processS7WriteItem(data, options.writePacketArray[foundSeqNum].itemList[itemCount], dataPointer);
 		if (!dataPointer) {
 			console.log('Stopping Processing Write Response Packet due to unrecoverable packet error');
@@ -1130,15 +1040,15 @@ writeResponse = function(data, foundSeqNum) {
 	options.writePacketArray[foundSeqNum].reqTime = process.hrtime(options.writePacketArray[foundSeqNum].reqTime);
 	console.log('Time is ' + options.writePacketArray[foundSeqNum].reqTime[0] + ' seconds and ' + Math.round(options.writePacketArray[foundSeqNum].reqTime[1] * 10 / 1e6) / 10 + ' ms.', 1, options.connectionID);
 
-	//	options.writePacketArray.splice(foundSeqNum, 1);
 	if (!options.writePacketArray[foundSeqNum].rcvd) {
 		options.writePacketArray[foundSeqNum].rcvd = true;
 		options.parallelJobsNow--;
 	}
+
 	clearTimeout(options.writePacketArray[foundSeqNum].timeout);
 
 	if (!options.writePacketArray.every(doneSending)) {
-		options.sendWritePacket();
+		eventor.emit('sendWritePacket')
 	} else {
 		for (i = 0; i < options.writePacketArray.length; i++) {
 			options.writePacketArray[i].sent = false;
@@ -1156,11 +1066,10 @@ writeResponse = function(data, foundSeqNum) {
 		}
 		options.writeSuccess(anyBadQualities);
 	}
-}
-
-function doneSending(element) {
+})
+.on('doneSending', (element)=>{
 	return ((element.sent && element.rcvd) ? true : false);
-}
+})
 
 readResponse = function(data, foundSeqNum) {
 	var self = this, i;
@@ -1242,9 +1151,9 @@ readResponse = function(data, foundSeqNum) {
 			options.resetNow();
 		}
 
-		if (!options.isReading() && options.writeInQueue) { options.sendWritePacket(); }
+		if (!options.isReading() && options.writeInQueue) { eventor.emit('sendWritePacket') }
 	} else {
-		options.sendReadPacket();
+		eventor.emit('sendReadPacket')
 	}
 }
 
@@ -1325,8 +1234,8 @@ function cleanup() {
 	}
 	clearTimeout(options.connectTimeout);
 	clearTimeout(options.PDUTimeout);
-	clearReadPacketTimeouts();  // Note this clears timeouts.
-	clearWritePacketTimeouts();  // Note this clears timeouts.
+	eventor.emit('clearReadPacketTimeouts')
+	eventor.emit('clearWritePacketTimeouts')
 }
 
 /**
@@ -1479,12 +1388,12 @@ function processS7WriteItem(theData, theItem, thePointer) {
 		return 0;   			// Hard to increment the pointer so we call it a malformed packet and we're done.
 	}
 
-	var writeResponse = theData.readUInt8(thePointer);
+	var thisReponse = theData.readUInt8(thePointer);
 
-	theItem.writeResponse = writeResponse;
+	theItem.thisReponse = thisReponse;
 
-	if (writeResponse !== 0xff) {
-		console.log('Received write error of ' + theItem.writeResponse + ' on ' + theItem.addr);
+	if (thisReponse !== 0xff) {
+		console.log('Received write error of ' + theItem.thisReponse + ' on ' + theItem.addr);
 		theItem.writeQualityBuffer.fill(0xFF);  // Note that ff is good in the S7 world but BAD in our fill here.
 	} else {
 		theItem.writeQualityBuffer.fill(0xC0);
@@ -2210,4 +2119,62 @@ function isQualityOK(obj) {
 		}
 	}
 	return true;
+}
+
+isWaiting = function() {
+	var self = this;
+	return (options.isReading() || options.isWriting());
+}
+
+isReading = function() {
+	var self = this, i;
+	// Walk through the array and if any packets are marked as sent, it means we haven't received our final confirmation.
+	for (i = 0; i < options.readPacketArray.length; i++) {
+		if (options.readPacketArray[i].sent === true) { return true }
+	}
+	return false;
+}
+
+isWriting = function() {
+	var self = this, i;
+	// Walk through the array and if any packets are marked as sent, it means we haven't received our final confirmation.
+	for (i = 0; i < options.writePacketArray.length; i++) {
+		if (options.writePacketArray[i].sent === true) { return true }
+	}
+	return false;
+}
+
+isOptimizableArea = function(area) {
+	var self = this;
+
+	if (options.doNotOptimize) { return false; } // Are we skipping all optimization due to user request?
+	switch (area) {
+		case 0x84: // db
+		case 0x81: // input bytes
+		case 0x82: // output bytes
+		case 0x83: // memory bytes
+			return true;
+		default:
+			return false;
+	}
+}
+
+findReadIndexOfSeqNum = function(seqNum) {
+	var self = this, packetCounter;
+	for (packetCounter = 0; packetCounter < options.readPacketArray.length; packetCounter++) {
+		if (options.readPacketArray[packetCounter].seqNum == seqNum) {
+			return packetCounter;
+		}
+	}
+	return undefined;
+}
+
+findWriteIndexOfSeqNum = function(seqNum) {
+	var self = this, packetCounter;
+	for (packetCounter = 0; packetCounter < options.writePacketArray.length; packetCounter++) {
+		if (options.writePacketArray[packetCounter].seqNum == seqNum) {
+			return packetCounter;
+		}
+	}
+	return undefined;
 }
